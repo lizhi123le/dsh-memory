@@ -61,19 +61,45 @@ REGISTRY = {
     # §2.9 承重面（预防性建模，无缺陷池编号），单调锚/外部时间锚属待建面输入
     "FI-M01": {"expected_verdict": "gap", "gap_tag": "v0.1§2.9承重面(A2单调锚待建)",
                "title": "时钟回拨：TTL 壁钟唯一时基被洗白"},
-    # S1 瞬态读失败被固化入检索缓存（N134，v16.md:86）——一次 OSError 固化为
-    # 「节点从检索面消失」，get 能读/search 搜不到撕裂；P1 fail-closed 缺席
-    "FI-M02": {"expected_verdict": "gap", "gap_tag": "N134",
-               "title": "瞬态读失败固化为检索面永久消失"},
+    # S1 瞬态读失败（N134，v16.md:86）——readcache 曾把 (None,None) 负结果当
+    # 正常值固化，一次独占句柄即「节点从检索面消失」，get 能读/search 搜不到
+    # 撕裂；P1 fail-closed 与 T4 静默损伤双缺口。
+    # **2026-09-29（C-3 批次）缺口结案 → 登记改 pass**：读路径拆出三态单点
+    # `MdCG._read_status`（第三元素 = 失败标签，判别函数
+    # `fsutil.classify_read_failure`：仅 FileNotFoundError 判终态「真缺」），
+    # readcache.install 据此**只接纳成功与终态真缺**、瞬时读失败不入缓存，
+    # 并把失败记进模块级计数+有界样本（fsutil.transient_read_stats，不再静默）。
+    # 本格由 EXPECTED_GAP 转 pass，此后作回归守卫（判据关掉即转 gap → 套件亮红；
+    # 定点变异自证见 md_cg/test_c3_transient_read_negative.py）。
+    "FI-M02": {"expected_verdict": "pass", "gap_tag": None,
+               "title": "瞬态读失败不固化检索面（C-3 修复后转 pass）"},
     # S2 写面漏标脏（N133，v16.md:85）——reinforce 写盘成功仅改内存 entry，
-    # 默认开读缓存把旧 fm 永久判新鲜；修复先例 mdcg.py:3242 在案
-    "FI-M03": {"expected_verdict": "gap", "gap_tag": "N133",
-               "title": "reinforce 写盘成功检索面读旧值"},
+    # 默认开读缓存把旧 fm 永久判新鲜；修复先例 mdcg.py:3242 在案。
+    # **2026-09-29（opt-batch1 C-1）缺口结案 → 登记改 pass**：同族三处写点
+    # （forgetting.reinforce / insight.verify / scrub._apply_offset）统一补
+    # `cg._dirty[node_id] = entry`，本格由 EXPECTED_GAP 转 pass，此后作
+    # 回归守卫（标脏失效即转 gap → 套件亮红）。
+    "FI-M03": {"expected_verdict": "pass", "gap_tag": None,
+               "title": "reinforce 写盘成功检索面同批可见（C-1 修复后转 pass）"},
     # S3 并发对撞（N138，v16.md:90）——_lock 仅覆盖 4 处记账清单，diagnose
     # 裸迭代共享面（sustain.py:484）无锁；读码断言为确定性基线，动态捕获
-    # RuntimeError 为时序敏感加分证据（未命中降级 NOTE 不虚判绿）
-    "FI-M04": {"expected_verdict": "gap", "gap_tag": "N138",
-               "title": "beat/heal/add 同实例并发对撞裸迭代崩溃面"},
+    # RuntimeError 为时序敏感加分证据（未命中降级 NOTE 不虚判绿）。
+    # **2026-09-29（H-4 批次 · v2 扩面）缺口止血 → 登记改 pass**：**全 md_cg 域**
+    # 的共享 index['nodes'] 迭代点在取用前先取快照（list(nodes.items()) /
+    # list(nodes.values()) / list(nodes)；sustain 四处 + weights 四处 +
+    # refindex 四处等，含测试面共 80 处），并发写不再触发 RuntimeError；判据与结果逐位不变
+    # （只换取用方式，live vs 全域回缺陷副本 38 条只读路径逐字节相同），_lock
+    # 覆盖范围**未扩**（实例级读写锁 / sustain 写路径消息化 / 线程模型重构属
+    # 设计级，本批不做）。**v1 只切 sustain.py 是切窄了**：默认 diagnose() 经
+    # evolution_candidates → weights.recalc → coverage_index，且无条件调
+    # refindex.check_refs，同一注入下现实现与回缺陷副本曾同崩于 weights.py:409
+    # （独立复核判 BLINDSPOT）——本格已同步扩面（读码断言覆盖 weights/refindex）。
+    # 本格此后作回归守卫：迭代点退回裸迭代 → 读码断言与动态捕获同时转红 →
+    # 套件亮红。定点变异自证（12 处各 2–3 红）、目标级判据（默认参数 diagnose
+    # 在并发写下不抛且回缺陷副本必抛）与逐位不变 oracle 见
+    # md_cg/test_h4_sustain_snapshot.py（正向 38 通过）。
+    "FI-M04": {"expected_verdict": "pass", "gap_tag": None,
+               "title": "beat/heal/add 同实例并发对撞裸迭代崩溃面（H-4 止血后转 pass）"},
     # S3 半程死亡：两段式对账把 kill(intent 与 outcome 之间) 收敛到如实标记
     # interrupted（A4 不假装成功）+ 对照格补 committed（R_NODE_OK）+ 幂等
     "FI-M05": {"expected_verdict": "pass", "gap_tag": None,

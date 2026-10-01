@@ -26,6 +26,12 @@
   全文}")[:16]——会话 uuid 每次重启必换（已实证）不可作身份锚；派生标识同
   会话重跑同值（稳定性断言在红绿守卫内）。节点 id 前缀
   `dsh-log-<派生标识>-<序号>`：同逻辑会话重跑幂等。
+  碰撞防线（N167）：主公式 basis 不含日志文件自身身份，缺 session 首行 /
+  同毫秒同首条 user / 退化日志可跨会话碰撞——摄取前核验既有节点归属
+  （frontmatter.dsh_log），非本会话即切兜底标识
+  sha256(f"{createdAt}|{首条 user}|{workspace}|{session_id}")[:16]
+  重编号摄取并 stderr 告警（derive_session_token_ext，正文不丢弃；
+  scripts/test_dsh_log_index_token.py 红绿守卫）。
 · 工具与报告**不打印日志正文原文**：stdout 只出统计与计数，无任何消息文本。
 · 既有 private 旧节点处置：v1/v2/v3 摄取的 private 版 dsh-log- 节点用
   `--retire-private-legacy` 软删除（forget：文件移 trash/ + 删除清单留痕 +
@@ -240,6 +246,17 @@ def _text_of(blocks) -> str:
     return "\n\n".join(p for p in parts if p.strip())
 
 
+def _as_dict(val) -> dict:
+    """非对象值一律归零 → {}（**形态判据单点**，N218）。
+
+    旧实现写的是 `o.get("data") or {}`：只兜住「缺失/假值」，兜不住「真值但非
+    对象」——`data=[1]` / `data="x"` / `data.message="x"` / `inserted[].source="x"`
+    都会在 `.get` 处抛 AttributeError。本函数把「非对象」与「缺失」两种形态收敛
+    为同一语义（按空对象处理），与既有 `or {}` 口径一致。
+    """
+    return val if isinstance(val, dict) else {}
+
+
 def parse_session_log(log_path: str) -> dict:
     """流式解析一个会话日志 → {meta, msgs, stats}。
 
@@ -247,6 +264,14 @@ def parse_session_log(log_path: str) -> dict:
     developer 正文，空正文不收）。
     stats：各行型计数 + 审计计数（audit）+ unknown 逐类型计数
     （unknown_types）——不含任何正文。
+
+    N218（2026-09-28）：非对象行按**同函数既有 fail-closed 纪律**记账后跳过——
+    旧实现 `json.loads` 只 catch ValueError（非 JSON），一行 `null`/`[]`/`123`/
+    `"x"` 解析合法却在 `o.get("type")` 抛 AttributeError 逃出 main（main 的 try
+    只有 finally、无 except）⇒ 整轮摄取中断：stdout 全空、无 TOTAL 汇总、其后
+    会话不再处理、stderr 只有栈无告警。次生腿=内层值非对象同型（`data=[1]` /
+    `data` 为字符串 / `data.message` 为字符串 / `inserted[].source` 为字符串），
+    故内层取值统一走 `_as_dict` 并计入 lines_bad_shape。
     """
     try:
         import zstandard                                   # noqa: F401
@@ -259,6 +284,7 @@ def parse_session_log(log_path: str) -> dict:
     seen_ids = set()                 # 消息 id 去重（spliced 与 user/message 同 id）
     cur_turn = 0
     st = {"lines_total": 0, "lines_known_other": 0, "lines_json_error": 0,
+          "lines_not_object": 0, "lines_bad_shape": 0,
           "user_dup_events": 0, "assistant_no_text": 0, "assistant_msgs": 0,
           "assistant_text_msgs": 0,
           "user_msgs": 0, "chars_user": 0, "chars_assistant": 0,
@@ -281,8 +307,20 @@ def parse_session_log(log_path: str) -> dict:
             except ValueError:
                 st["lines_json_error"] += 1
                 continue
+            if not isinstance(o, dict):
+                # N218 主腿：合法 JSON 但顶层非对象（null/[]/123/"x"/true）——
+                # 按既有 fail-closed 纪律记账后跳过，不中断整轮摄取
+                st["lines_not_object"] += 1
+                continue
             t = o.get("type")
-            d = o.get("data") or {}
+            if not isinstance(t, str):
+                # 形态非法：`type` 非字符串（list/dict 还不可哈希，`t in frozenset`
+                # 直接 TypeError）。与顶层非对象同族，记账跳过。
+                st["lines_bad_shape"] += 1
+                continue
+            if o.get("data") is not None and not isinstance(o.get("data"), dict):
+                st["lines_bad_shape"] += 1          # data 非对象：记账（按空对象处理）
+            d = _as_dict(o.get("data"))
             if t == "session":
                 meta = {"id": o.get("id"),
                         "created_at_ms": o.get("createdAt"),
@@ -306,10 +344,19 @@ def parse_session_log(log_path: str) -> dict:
                 st["chars_user"] += len(body)
                 msgs.append({"turn": cur_turn, "role": "user", "text": body})
             elif t == "agent/inbox/spliced":
-                for it in d.get("inserted") or []:
+                inserted = d.get("inserted")
+                if inserted is not None and not isinstance(inserted, list):
+                    st["lines_bad_shape"] += 1      # 非列表：形态非法，记账跳过
+                    continue
+                for it in inserted or []:
                     if not isinstance(it, dict):
+                        st["lines_bad_shape"] += 1  # 列表项非对象：记账跳过
                         continue
-                    if (it.get("source") or {}).get("kind") != "user":
+                    src = it.get("source")
+                    if src is not None and not isinstance(src, dict):
+                        st["lines_bad_shape"] += 1  # source 非对象：记账跳过
+                        continue
+                    if (src or {}).get("kind") != "user":
                         continue                  # 只收 source.kind=="user"
                     mid = it.get("id")
                     if mid and mid in seen_ids:
@@ -324,7 +371,9 @@ def parse_session_log(log_path: str) -> dict:
                     st["chars_user"] += len(body)
                     msgs.append({"turn": cur_turn, "role": "user", "text": body})
             elif t == "assistant/message":
-                m = d.get("message") or {}
+                if d.get("message") is not None and not isinstance(d.get("message"), dict):
+                    st["lines_bad_shape"] += 1      # message 非对象：记账（按空对象处理）
+                m = _as_dict(d.get("message"))     # N218：message 非对象按空对象处理
                 mid = m.get("id") or d.get("id")
                 if mid and mid in seen_ids:
                     st["user_dup_events"] += 1
@@ -347,7 +396,9 @@ def parse_session_log(log_path: str) -> dict:
                 # assistant/message 同形态（data.turn/step 归轮次）；回退
                 # data.content 对齐 dsh-TUI firstText 的两级取正文语义。
                 role = "system" if t == "system/message" else "developer"
-                m = d.get("message") or {}
+                if d.get("message") is not None and not isinstance(d.get("message"), dict):
+                    st["lines_bad_shape"] += 1      # message 非对象：记账（按空对象处理）
+                m = _as_dict(d.get("message"))     # N218：message 非对象按空对象处理
                 mid = m.get("id") or d.get("id")
                 if mid and mid in seen_ids:
                     st["user_dup_events"] += 1
@@ -475,14 +526,47 @@ def derive_session_token(meta: dict, msgs: list) -> str:
     sha256(f"{createdAt毫秒}|{首条 user 消息全文}")[:16]——uuid 每次重启必换
     不可作身份锚；派生标识对同一日志文件逐字节稳定（同会话重跑同值）。
     无 user 消息的退化日志仍确定（basis 只含时间戳与分隔符）。
+
+    碰撞面（N167）：basis 不含日志文件自身身份，「缺 type=session 首行」
+    「同毫秒+同首条 user」「同为无 user 退化」等场景下**不同会话**会派生出
+    同一 token。防线不在本函数（主公式保持不动=既有节点幂等不迁移），在
+    ingest_transcript 的归属核验：碰撞即切 derive_session_token_ext 兜底
+    空间重编号摄取并 stderr 告警（scripts/test_dsh_log_index_token.py 守卫）。
     """
     first_user = next((m["text"] for m in msgs if m.get("role") == "user"), "")
     basis = f"{meta.get('created_at_ms')}|{first_user}"
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
+def derive_session_token_ext(meta: dict, msgs: list, workspace: str,
+                             session_id: str) -> str:
+    """碰撞兜底标识：basis 追加日志文件路径身份（workspace|session_id）（N167）。
+
+    (workspace, session_id) 目录对唯一标识一个日志文件且跨重启稳定——
+    同文件重跑同值（兜底空间内幂等），不同文件恒不同（sha256 抗碰）。
+    """
+    first_user = next((m["text"] for m in msgs if m.get("role") == "user"), "")
+    basis = (f"{meta.get('created_at_ms')}|{first_user}"
+             f"|{workspace}|{session_id}")
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def _dsh_log_owner(cg, nid):
+    """既有 dsh-log- 节点的归属 (session, workspace)；读不出 → (None, None)。
+
+    经公开读面 cg.get（读隔离内：internal 共享档跨会话可见；private 旧版
+    无密钥/不可见时返回 None）。读不出归属按**非本会话**处置（fail-closed）：
+    宁可切兜底空间多入一份，不可静默吞掉本会话正文（N167 修的正是静默丢）。
+    """
+    g = cg.get(nid)
+    if not g:
+        return None, None
+    dl = (g.get("frontmatter") or {}).get("dsh_log") or {}
+    return dl.get("session"), dl.get("workspace")
+
+
 def ingest_transcript(cg, workspace: str, session_id: str, tdir: str,
-                      token: str) -> dict:
+                      token: str, ext_token: str = None) -> dict:
     """索引一个会话的转写目录并写入活库（已存在节点跳过，不覆写）。
 
     章节切分走 refindex.index_dir(kind="doc_ref")——与 mcp_server index_doc op
@@ -496,9 +580,31 @@ def ingest_transcript(cg, workspace: str, session_id: str, tdir: str,
         dsh_session_uuid 留痕；
       · 不写 doc_ref / 不登记 Ledger（理由见模块 docstring），
         溯源另记 frontmatter.dsh_log。
+
+    碰撞防线（N167）：摄取前核验主 token 下既有节点归属——任一节点存在但
+    frontmatter.dsh_log 不指向本会话（被**别的**会话占用：同毫秒同首条 /
+    缺 session 首行 / 退化日志的跨会话派生碰撞）即整体切 ext_token 兜底
+    空间重编号摄取，返回值带 collision 由调用方 stderr 告警。不再无条件
+    skip-existing（旧逻辑把碰撞第二会话的全部章节静默跳过=数据丢失）。
+    存在性判定走索引（与可见性/密钥无关——private 旧节点同样算占用），
+    归属核验走 _dsh_log_owner 的公开读面（读不出=非本会话，fail-closed）。
     """
     items, errors, stats = refindex.index_dir(
         tdir, kind="doc_ref", max_files=100, max_items=50000)
+    existing = cg.index.get("nodes") or {}
+    collision = None
+    if ext_token and ext_token != token:
+        for i in range(len(items)):
+            nid = f"dsh-log-{token}-{i:04d}"
+            if nid not in existing:
+                continue
+            o_sid, o_ws = _dsh_log_owner(cg, nid)
+            if o_sid == session_id and o_ws == workspace:
+                continue                        # 本会话既有节点：幂等重跑
+            collision = {"token": token, "token_ext": ext_token,
+                         "occupied_by": {"session": o_sid, "workspace": o_ws}}
+            token = ext_token                   # 整体切兜底空间重编号
+            break
     indexed, skipped_existing, sens_counts = [], 0, {}
     for i, it in enumerate(items):
         nid = f"dsh-log-{token}-{i:04d}"
@@ -527,7 +633,7 @@ def ingest_transcript(cg, workspace: str, session_id: str, tdir: str,
         indexed.append(nid)
     return {"items": len(items), "indexed": indexed,
             "skipped_existing": skipped_existing,
-            "sensitivity": sens_counts,
+            "sensitivity": sens_counts, "collision": collision,
             "extract_errors": errors[:5], "stats": stats}
 
 
@@ -622,8 +728,10 @@ def main(argv=None) -> int:
              "turns_context": 0,
              "nodes_indexed": 0, "nodes_skipped_existing": 0,
              "chars": 0, "lines_skipped": 0,
+             "lines_not_object": 0, "lines_bad_shape": 0,
              "audit": {t: 0 for t in AUDIT_EVENT_TYPES},
-             "unknown_lines": 0, "unknown_types": {}}
+             "unknown_lines": 0, "unknown_types": {},
+             "token_collisions": 0}
     per_session_unknown = []             # [(session_id, {type: count})] verbose 用
     session_tokens = {}                  # session_id -> 派生标识（稳定性审计）
     cg = None
@@ -631,6 +739,9 @@ def main(argv=None) -> int:
         for s in sessions:
             parsed = parse_session_log(s["log"])
             token = derive_session_token(parsed["meta"], parsed["msgs"])
+            ext_token = derive_session_token_ext(
+                parsed["meta"], parsed["msgs"], s["workspace"],
+                s["session_id"])
             session_tokens[s["session_id"]] = token
             md = render_transcript(s["workspace"], parsed)
             tdir = transcript_path(s["workspace"], s["session_id"])
@@ -657,6 +768,8 @@ def main(argv=None) -> int:
                                "types": dict(st["unknown_types"])},
                    "skipped": {"known_other": st["lines_known_other"],
                                "json_error": st["lines_json_error"],
+                               "not_object": st["lines_not_object"],
+                               "bad_shape": st["lines_bad_shape"],
                                "assistant_no_text": st["assistant_no_text"],
                                "context_no_text": st["context_no_text"],
                                "dup_events": st["user_dup_events"]},
@@ -669,9 +782,13 @@ def main(argv=None) -> int:
                                + ctx_chars)
             total["lines_skipped"] += (st["lines_known_other"]
                                        + st["lines_json_error"]
+                                       + st["lines_not_object"]
+                                       + st["lines_bad_shape"]
                                        + st["assistant_no_text"]
                                        + st["context_no_text"]
                                        + st["user_dup_events"])
+            total["lines_not_object"] += st["lines_not_object"]
+            total["lines_bad_shape"] += st["lines_bad_shape"]
             for t, c in st["audit"].items():
                 total["audit"][t] += c
             total["unknown_lines"] += st["unknown_lines"]
@@ -703,12 +820,24 @@ def main(argv=None) -> int:
                 if not cs.get("unlocked"):
                     raise SystemExit(f"加密未解锁，拒绝写入私有内容：{cs}")
                 ing = ingest_transcript(cg, s["workspace"], s["session_id"],
-                                        tdir, token)
+                                        tdir, token, ext_token)
                 row["chapters"] = ing["items"]
                 row["nodes_indexed"] = len(ing["indexed"])
                 row["nodes_skipped_existing"] = ing["skipped_existing"]
                 row["sensitivity"] = ing["sensitivity"]
                 row["node_ids"] = ing["indexed"][:5]
+                if ing.get("collision"):
+                    row["token_collision"] = ing["collision"]
+                    row["session_token_main"] = token   # 主标识留痕（已让位）
+                    row["session_token"] = ext_token    # 生效标识=兜底空间
+                    total["token_collisions"] += 1
+                    c = ing["collision"]
+                    print(f"WARNING: 会话 {s['workspace']}/{s['session_id']}"
+                          f" 派生标识碰撞（主标识 {c['token']} 已被会话"
+                          f" {c['occupied_by']['workspace']}/"
+                          f"{c['occupied_by']['session']} 占用）——"
+                          f"切兜底标识 {c['token_ext']} 重编号摄取，"
+                          "正文不丢弃（N167 防线）", file=sys.stderr)
                 if ing["extract_errors"]:
                     row["extract_errors"] = ing["extract_errors"]
                 if ing["stats"].get("truncated"):
@@ -766,6 +895,14 @@ def main(argv=None) -> int:
                 for t, c in sorted(utypes.items()):
                     print(f"unknown-type: {t} × {c}（会话 {sid}）",
                           file=sys.stderr)
+    # N218 同款 fail-closed 纪律：非对象/形态非法行已按 json_error 同族记账并跳过
+    # （不中断整轮摄取）——但仍须显式告警，绝不让日志损坏静默消失。
+    if total["lines_not_object"] or total["lines_bad_shape"]:
+        print(f"WARNING: 检出 {total['lines_not_object']} 行顶层非对象 JSON 与 "
+              f"{total['lines_bad_shape']} 行形态非法（type 非字符串 / data·"
+              "message·inserted 形态不符）——已按失败行记账并跳过，"
+              "未中断本轮摄取；请检查会话日志是否损坏或被截断",
+              file=sys.stderr)
     return 0
 
 
