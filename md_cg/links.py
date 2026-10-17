@@ -6,7 +6,9 @@
 本层**不做密码学**（设计裁决 D-4）：签名一律经 `signer.sign_for / verify_for`
 按子系统策略调用，内核只保证「策略被读取并执行」。
 
-四条不可动摇的性质（文档 §3.2 / §4.3）：
+真源：`docs/swarm/蜂群互联_v0.1.md`（该文档用阿拉伯数字章节号；下文「蜂群互联 §x」均指它）。
+
+四条不可动摇的性质（蜂群互联 §3.2 / §4.3）：
 
 1. **P_trust 是概率估计，不是承诺**——可上调、可下调、**可被反例击穿**；
 2. **有上限 `p_trust_cap`**——受版本对齐度与节点完整度约束，不能靠高频交互刷高；
@@ -14,7 +16,7 @@
 4. **全程留痕**——`audit` 记录每次变更的证据与依据条款（宪章第二十四条）。
 
 诚实边界：`UP_STEP` / `DOWN_STEP` / `DECAY_DAYS` / `PROBATION_SECONDS`
-**均为未标定占位值**（文档 §4.3：「v0.1 只声明结构，不宣称权重数值」）。
+**均为未标定占位值**（蜂群互联 §4.3：「只声明结构，不宣称权重数值」）。
 标定属路线图 v0.3，本模块只保证结构、方向与不可自放大。
 
 零第三方依赖。
@@ -196,7 +198,7 @@ def position_preference(position: str) -> dict:
     """该位置的分量偏好序（委派 `md_cg.weights`，纯结构、无数值）。
 
     仅作查询/自描述，**不改动** `_cap_for` 的既有默认行为——对齐「先声明
-    结构、数值标定 DEFER」的纪律（文档 §4.3）。
+    结构、数值标定 DEFER」的纪律（蜂群互联 §4.3）。
     """
     from . import weights as _w
     return {"position": position, "dominant": _w.dominant(position),
@@ -240,7 +242,7 @@ def evidence_payload(peer_node_id: str, evidence: str, positive: bool) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# 握手（文档 §5.1 五步：① 声明 → ② 校验 → ③ 建档 → ④ 观察期；⑤ 转正见 promote）
+# 握手（蜂群互联 §5.1 五步：① 声明 → ② 校验 → ③ 建档 → ④ 观察期；⑤ 转正见 promote）
 # --------------------------------------------------------------------------
 
 # 生效条件：peer_node_id 为假值（空串）时抛 LinkError，不以 agent: 开头的会被补前缀；ver.ok 为假时按 on_fail 取 reject 抛 LinkError、取 isolate 置 isolated、否则置 degraded，declared_charter 为假值时观察期按 PROBATION_SECONDS*2 计，未失败但版本不符仅记 version_misaligned 审计，正常路径返回 {'ok': True, 'link', 'alignment', 'signature'}；
@@ -253,7 +255,7 @@ def handshake(peer_node_id: str, *, peer_theory: dict = None,
     if not peer_node_id:
         raise LinkError("peer_node_id 不能为空")
     if not peer_node_id.startswith("agent:"):
-        peer_node_id = "agent:" + peer_node_id      # §4.2 全局唯一主体 id
+        peer_node_id = "agent:" + peer_node_id      # 蜂群互联 §4.2 全局唯一主体 id
 
     align = version_alignment(peer_theory)
     payload = handshake_payload(peer_node_id, peer_theory, position_map)
@@ -345,6 +347,18 @@ def handshake(peer_node_id: str, *, peer_theory: dict = None,
 # --------------------------------------------------------------------------
 
 # 生效条件：peer 经 load(path)/_find 命中连接（未命中或 status 为 "withdrawn" 时抛 LinkError）；`_signer.verify_for(...)` 返回值中 ok 非真时按 `ver.get("on_fail") or "degrade"` 处置——"reject" 抛 LinkError，其余置 isolated/degraded 后返回 ok False；验签通过则 delta=UP_STEP if positive else -DOWN_STEP，P_trust 置 `round(max(0.0, min(cap, before + delta)), 6)`（cap 取 `link.get("p_trust_cap") or 0.0`），负证据且新 P_trust<DEGRADE_BELOW 且原状态在 IN_TRUST 时降级，返回 ok True、link、delta。
+def _weaker_subsystem(subsystem: str, baseline: str,
+                      signers_file: str = None) -> str:
+    """issue #167：调用方子系统相对**基准子系统**是否更松（更松返回原因串）。
+
+    基准 = 连接建档时的子系统（observe 的验签要求不得被调用方参数顶掉）。
+    """
+    if not subsystem or not baseline or subsystem == baseline:
+        return ""
+    return _signer.weaker_than(_signer.policy_for(subsystem, signers_file),
+                               _signer.policy_for(baseline, signers_file))
+
+
 def observe(peer: str, *, evidence: str, positive: bool = True,
             subsystem: str = None, peer_signature: str = None,
             path: str = None, signers_file: str = None,
@@ -365,6 +379,13 @@ def observe(peer: str, *, evidence: str, positive: bool = True,
         if link["status"] == "withdrawn":
             raise LinkError(f"连接已退出：{peer}")
 
+        # issue #167：`subsystem or link.get("subsystem")` 是**调用方参数优先**，
+        # 用更松的子系统策略即顶掉建档子系统的验签要求（验签前置）。
+        _rec_sub = link.get("subsystem") or None
+        _why = _weaker_subsystem(subsystem, _rec_sub, signers_file)
+        if _why:
+            raise LinkError("observe 子系统策略不得弱于建档子系统 %s：%s"
+                            % (_rec_sub, _why))
         payload = evidence_payload(link["peer_node_id"], evidence, positive)
         ver = _signer.verify_for(subsystem or link.get("subsystem") or None,
                                  payload, peer_signature or "",
@@ -506,7 +527,7 @@ def decay_all(*, path: str = None, now: float = None,
             if abs(link["decay"]) > 1e-9:
                 link["p_trust"] = after
                 _audit(link, "decay", by=actor,
-                       clause="§3.2（无观测向初值回归）",
+                       clause="蜂群互联 §3.2（无观测向初值回归）",
                        days=round(days, 3), p_trust=after)
                 changed.append({"link_id": lid,
                                 "peer_node_id": link["peer_node_id"],

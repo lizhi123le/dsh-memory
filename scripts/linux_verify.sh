@@ -38,6 +38,7 @@ echo "=== python 套件 ==="
 # 读缓存/MdStore 预计算逐位对照/p43 回流守恒。依赖 gitignored 本地语料的
 # 套件（p44/md_access_parity）不入清单（容器内必缺，由 run_tests SKIP 面
 # 在有语料的机器覆盖）。
+# 0.7.2 读面损坏 UTF-8 族：补登 test_health_corrupt_utf8 / test_corrupt_utf8_read_surfaces（Linux 容器单跑与 --mutate 自证均已绿，2026-10-04）。
 for t in test_hive_ingest test_p38_concurrent_flush test_p39_verify_flow \
          test_interop test_subproc_encoding \
          test_p29_session_ingest_export test_p2 test_p2_mcp test_p3 \
@@ -45,11 +46,20 @@ for t in test_hive_ingest test_p38_concurrent_flush test_p39_verify_flow \
          test_readcache_prodpath test_mdstore_search_parity \
          test_rejected_redact test_rejected_credential_forms test_ccg_form_parity test_wisdom_md_store \
          test_neg_condition_hits test_token_lowercase_form test_srcindex \
-         test_logref test_p28_refcheck test_n225_nonobject_load; do
+         test_logref test_p28_refcheck test_n225_nonobject_load \
+         test_issue52_scan_condition_first test_stgidx_index_parity \
+         test_health_corrupt_utf8 test_corrupt_utf8_read_surfaces \
+         test_spatial_coords3d test_sleep_gitlock; do
   out=$(python3 -m "md_cg.$t" 2>&1 | tail -1); rc=$?
   record "md_cg.$t" $rc
   echo "    -> $out"
 done
+
+# 身体×脑组合冒烟（0.8.0 对接，四条裁定之四：进发布链）：
+# 身体侧视角经 MCP 全链（记账→台账→投影→查询），隔离库、退出码判据。
+out=$(python3 scripts/body_e2e_smoke.py 2>&1 | tail -1); rc=$?
+record "body_e2e_smoke" $rc
+echo "    -> $out"
 
 for t in hive/test_orch.py hive/test_exec_tools.py hive/test_serve_entry.py \
          hive/test_result_anchor_chain.py; do
@@ -85,13 +95,24 @@ echo "=== 断言判别力自证（退出码 0 = 变异后如预期转红）==="
 # tombstone 也当坏载荷）⇒ 2（G）；排序键归一（坏型槽记 0）⇒ 5（F）；tombstone 重放
 # （e is None ⇒ pop）⇒ 2（G，与上条从过窄/过宽两侧钉同一口径）；read_jsonl 原样
 # 产出 ⇒ 2（H）。锚点漂移同样退出码 2。
+# issue #52 面（2026-10-03 并入）：八处定点变异（三处契约点名：条件过滤移回截断
+# 之后 / 去掉 truncated 上报 / 截断选序改回字典序；另加 _scan 切片回退 / 默认值改
+# 全量 / _sec 闸绕过 / 快照回退删分支 / layer 过滤失效）各自**恰好**命中预期条数
+# （24/15/3/4/4/3/1/2），且无空转断言；锚点漂移＝退出码 2。另有 --legacy-baseline
+# 重建修前形态（切片先于条件 + 无截断上报），断言须转红——抓得住 #52 本身。
+# stgidx 面（2026-10-03 并入）：17 处定点变异（写钩增量/删钩/取数序/回退静默/资格当过滤/
+# by_time 序错等）各自**恰好**命中；锚点漂移＝退出码 2；防误删自检（_table_gaps）。
 for spec in "test_neg_condition_hits --head-baseline" \
             "test_neg_condition_hits --branch-baseline" \
             "test_policy_required_ccg --head-baseline" \
             "test_token_lowercase_form --head-baseline" \
             "test_logref --head-baseline" \
             "test_p28_refcheck --head-baseline" \
-            "test_n225_nonobject_load --branch-baseline"; do
+            "test_n225_nonobject_load --branch-baseline" \
+            "test_issue52_scan_condition_first --branch-baseline" \
+            "test_issue52_scan_condition_first --legacy-baseline" \
+            "test_stgidx_index_parity --branch-baseline" \
+            "test_spatial_coords3d --mutate"; do
   set -- $spec
   out=$(python3 -m "md_cg.$1" "$2" 2>&1 | tail -1); rc=$?
   record "md_cg.$1 $2" $rc

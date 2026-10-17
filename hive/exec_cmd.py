@@ -20,10 +20,14 @@ result.json 的 error 字段），区别是**不调 LLM**——把 spec 里的�
 订阅约定：model 写 "cmd"、user_prompt 写任务标签——仅为过 rust 侧必填校验，本执行器不调 API。
 
 command 只收 argv 数组，字符串形态一律拒绝（不经 shell，规避转义/GBK 陷阱，第 15 条）。
+字段脏类型一律**规格错**（rc=2）：`commands` 非数组、`env` 非对象、`timeout_step_s`
+非数字（含 step 内同名字段与 `cwd` 非字符串）都在进执行前拦下——不得让类型异常逃到
+顶层兜底被记成「执行错」（N234，2026-10-05）。
 
 退出码：0 成功 / 2 规格错 / 3 执行错（与 exec.py 同形）。
 """
 from __future__ import annotations
+import re
 
 import json
 import os
@@ -80,10 +84,13 @@ def _write_result(job_dir: str, obj: dict) -> None:
 # 生效条件：job_dir 与 msg 传入时写 job_dir/log.txt 一行带时间戳日志（观测面——open 失败降级 stderr，绝不打断任务，对齐 exec.py log 同族）。
 def _log(job_dir: str, msg: str) -> None:
     line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+    # #465：改走跨进程安全追加；**保住 :83 的既有生效条件**——
+    # 失败/超时一律降级 stderr、**绝不打断任务**（不得把「写失败」变成抛出）。
     try:
-        with open(os.path.join(job_dir, "log.txt"), "a", encoding="utf-8") as f:
-            f.write(line)
-    except (OSError, TypeError):
+        from hive._append import append_line as _append_line
+    except ImportError:                                    # 脚本方式直跑（无包上下文）
+        from _append import append_line as _append_line
+    if not _append_line(os.path.join(job_dir, "log.txt"), line, tag="exec_cmd"):
         sys.stderr.write(line)
 
 
@@ -106,7 +113,93 @@ def _fail(job_dir: str, msg: str, code: int = EXIT_SPEC, extra: dict | None = No
     return code
 
 
-# 生效条件：spec["commands"] 为非空 list 时逐项归一（dict 原样收、list 包成 {"command": item}、其它类型返回错误 err），commands 缺失/非 list/空列表时若 spec.get("command") 为真值则只生成单步，否则返回 (None, None) 走 LLM 委托；随后逐步校验 command：是字符串时报「只收 argv 数组」，是 None 或不是「非空且全为 str 的 list」时统一报「必须是非空字符串数组」。
+# 生效条件：spec 为 dict 时逐项做**规格前置类型闸**——`commands` 键存在且非 None 时必须
+# 是 list（空列表合法：落回 `command` 口径）、`env` 非 None 时必须是为 dict、
+# `timeout_step_s` 非 None 时必须为数字（bool 不算——它是 int 子类但不是时长语义）；
+# 命中任一返回人话规格错文案，否则返回 None。
+# 为什么必须显式闸（N234，2026-10-05）：脏类型会让下游抛 AttributeError / ValueError /
+# TypeError 逃出 run_cmd，由 main 顶层兜底成 EXIT_EXEC(3)——规格错被记成执行错，与
+# :24「2=规格错 / 3=执行错」相悖；且 `commands` 非 list 真值形态旧版静默落进
+# 「无命令 → 转发 LLM」（:253-254）：确定性命令从未执行却以 ok=true 落盘，与同字段
+# 字符串 `command` 在 :128-131 的规格错执法不一致。
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+
+# ---- issue #464：池内 spec 的两道根闸（本件即其载体）---------------------------------
+# ★单点真源 + 派生视图（照 hive/exec.py 的 PII_FAMILIES -> _PII_PATTERNS 既有形态）：
+#   ENV_SECRET_FAMILIES 是**唯一手写清单**；ENV_SECRET_RES 与 is_secret_env_name 均由它派生。
+#
+# 与既有两族的关系（**本表属第三族**，不合并）：
+#   · hive/exec.py 的 PII_FAMILIES -> _PII_PATTERNS：对象是**内容形态**（文本里长什么样）；
+#   · md_cg/interop.py 的 _FORBIDDEN_RES：对象是**发布闸**（哪些串不许进发布物）；
+#   · 本表：对象是**环境变量名**（哪些名字不得继承给子进程）。对象不同故不合并；
+#     且 hive 不得反向依赖 md_cg（C1 腿所钉的约束）⇒ 不能复用 interop 的清单。
+#   · **已知漂移风险**：_FORBIDDEN_RES 与 _PII_PATTERNS 之间已按站点拆分、分叉点有注释与矩阵腿
+#     （hive/exec.py:1176 + md_cg/test_issue419_pii_redaction.py）。本表同样可能漂 —— 故必须登记在此，
+#     **不登记的副本就是下一例**。
+ENV_SECRET_FAMILIES = (
+    ('key', r'(?:^|_)(?:API_?)?KEY(?:$|_)'),
+    ('token', r'(?:^|_)TOKENS?(?:$|_)'),
+    ('secret', r'(?:^|_)SECRETS?(?:$|_)'),
+    ('password', r'(?:^|_)PASS(?:WORD|WD)?(?:$|_)'),
+    ('credential', r'(?:^|_)CREDENTIALS?(?:$|_)'),
+    ('designer_key', r'^AEIS_DESIGNER_KEY$'),
+)  #: 手写唯一真源；新增族只改这里
+#: _PII_PATTERNS 式派生视图
+ENV_SECRET_RES = tuple((label, re.compile(pat)) for label, pat in ENV_SECRET_FAMILIES)
+
+#: 允许的可执行文件（裸名）白名单
+ALLOWED_EXECUTABLES = ('python', 'python3', 'py', 'node', 'npm', 'npx', 'git')
+
+
+# 生效条件：name 为字符串即成立；大小写归一后任一 ENV_SECRET_RES 命中即 True。
+def is_secret_env_name(name) -> bool:
+    n = str(name).upper()
+    return any(rx.search(n) for _lab, rx in ENV_SECRET_RES)
+
+
+# 生效条件：env 为 dict 或 None 即成立；返回剥离敏感键后的新 dict（不改原 dict）。
+def strip_secret_env(env: dict) -> dict:
+    return {str(k): v for k, v in (env or {}).items() if not is_secret_env_name(k)}
+
+
+# 生效条件：argv 为非空字符串列表即成立；返回 None（放行）或错误字符串（拒）。
+def command_root_gate(argv):
+    if not (isinstance(argv, list) and argv and all(isinstance(x, str) for x in argv)):
+        return 'command 必须是非空字符串数组'
+    exe = argv[0]
+    roots = (os.path.dirname(os.path.realpath(sys.executable)),
+             os.path.realpath(tempfile.gettempdir()))
+    if os.sep in exe or (os.altsep and os.altsep in exe):
+        real = os.path.realpath(exe)
+        if not any(real == r or real.startswith(r + os.sep) for r in roots):
+            return ('可执行文件根闸：%s 不在允许根内（%s）——池内 spec 不得执行任意路径的程序'
+                    % (real, ', '.join(roots)))
+        return None
+    if exe not in ALLOWED_EXECUTABLES:
+        return ('可执行文件根闸：%r 不在白名单内（%s）——需新增请改 ALLOWED_EXECUTABLES'
+                % (exe, ', '.join(ALLOWED_EXECUTABLES)))
+    return None
+
+
+def _spec_gate(spec: dict):
+    raw = spec.get("commands")
+    if raw is not None and not isinstance(raw, list):
+        return ('commands 必须是数组（对象数组 [{"command": [...]}] 或 argv 数组 '
+                '["python","x.py"]）——当前是 %s；本执行器不把脏类型当「无命令」'
+                '转发 LLM' % type(raw).__name__)
+    env = spec.get("env")
+    if env is not None and not isinstance(env, dict):
+        return "env 必须是对象（键值对）——当前是 %s" % type(env).__name__
+    ts = spec.get("timeout_step_s")
+    if ts is not None and not _is_num(ts):
+        return "timeout_step_s 必须是数字（秒）——当前是 %s" % type(ts).__name__
+    return None
+
+
+# 生效条件：spec["commands"] 为非空 list 时逐项归一（dict 原样收、list 包成 {"command": item}、其它类型返回错误 err），commands 缺失/非 list/空列表时若 spec.get("command") 为真值则只生成单步，否则返回 (None, None) 走 LLM 委托；随后逐步校验 command：是字符串时报「只收 argv 数组」，是 None 或不是「非空且全为 str 的 list」时统一报「必须是非空字符串数组」；并做步内字段类型闸（N234 同族：cwd 非字符串、timeout_step_s 非数字会让 _run_step 抛 TypeError/ValueError 逃出 run_cmd 记成执行错）——任一报错均返回 (None, err) 由调用方按规格错（rc=2）收口。
 def _norm_steps(spec: dict):
     """→ (steps, err)；两者皆 None 表示「无命令 → 走 LLM 委托」。"""
     raw = spec.get("commands")
@@ -130,6 +223,17 @@ def _norm_steps(spec: dict):
                           '请改 ["python","scripts/x.py"] 形态')
         if not (isinstance(argv, list) and argv and all(isinstance(x, str) for x in argv)):
             return None, f"第 {i} 步 command 必须是非空字符串数组"
+        _gate = command_root_gate(argv)
+        if _gate:
+            return None, "第 %d 步 %s" % (i, _gate)
+
+        cwd = s.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            return None, f"第 {i} 步 cwd 必须是字符串路径——当前是 {type(cwd).__name__}"
+        ts = s.get("timeout_step_s")
+        if ts is not None and not _is_num(ts):
+            return None, (f"第 {i} 步 timeout_step_s 必须是数字（秒）——当前是 "
+                          f"{type(ts).__name__}")
     return steps, None
 
 
@@ -238,7 +342,7 @@ def _delegate(job_dir: str, spec: dict | None = None) -> int:
     return p.returncode
 
 
-# 生效条件：job_dir/spec.json 读取抛 OSError/ValueError 即 _fail(..., EXIT_SPEC)；_norm_steps 返回 err 即 _fail(..., EXIT_SPEC)、返回 steps 为 None 即转 _delegate(job_dir, spec)；否则 env 由 spec.get("env") 字符串化后叠加在 os.environ 之上并 setdefault PYTHONUTF8="1"，default_cwd 取 spec.get("cwd") or spec.get("workdir") or job_dir，fail_fast 取 spec.get("fail_fast", True)（显式假值则不提前中断），逐步 _run_step 后按 expect_files、expect_stdout_contains 缺失项追加失败记录，写 result.json 并返回 EXIT_OK 或 EXIT_EXEC。
+# 生效条件：job_dir/spec.json 读取抛 OSError/ValueError 即 _fail(..., EXIT_SPEC)；_spec_gate 命中（commands/env/timeout_step_s 脏类型）即 _fail(..., EXIT_SPEC)；_norm_steps 返回 err 即 _fail(..., EXIT_SPEC)、返回 steps 为 None 即转 _delegate(job_dir, spec)；否则 env 由 spec.get("env") 字符串化后叠加在 os.environ 之上并 setdefault PYTHONUTF8="1"，default_cwd 取 spec.get("cwd") or spec.get("workdir") or job_dir，fail_fast 取 spec.get("fail_fast", True)（显式假值则不提前中断），逐步 _run_step 后按 expect_files、expect_stdout_contains 缺失项追加失败记录，写 result.json 并返回 EXIT_OK 或 EXIT_EXEC。
 def run_cmd(job_dir: str) -> int:
     t0 = time.time()
     try:
@@ -247,6 +351,9 @@ def run_cmd(job_dir: str) -> int:
     except (OSError, ValueError) as e:
         return _fail(job_dir, f"spec.json 读取失败：{e}", EXIT_SPEC)
 
+    gate_err = _spec_gate(spec)
+    if gate_err:
+        return _fail(job_dir, gate_err, EXIT_SPEC)
     steps, err = _norm_steps(spec)
     if err:
         return _fail(job_dir, err, EXIT_SPEC)
@@ -254,7 +361,10 @@ def run_cmd(job_dir: str) -> int:
         return _delegate(job_dir, spec)
 
     env = {str(k): str(v) for k, v in (spec.get("env") or {}).items()}
-    env = {**os.environ, **env}
+    # issue #464：剥离敏感键后再叠加 —— serve 凭据（*_KEY/TOKEN/SECRET/PASSWORD、
+    # AEIS_DESIGNER_KEY）不得经子任务外带；清单派生自 ENV_SECRET_FAMILIES（单一真源）。
+    env = strip_secret_env(env)
+    env = {**strip_secret_env(dict(os.environ)), **env}
     env.setdefault("PYTHONUTF8", "1")
     default_cwd = spec.get("cwd") or spec.get("workdir") or job_dir
     fail_fast = spec.get("fail_fast", True)

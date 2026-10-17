@@ -25,11 +25,20 @@
     闸门 1 · grounding 支撑度（确定性）：候选短语必须能在节点正文里找到字符级依据，
         否则判为幻觉 → REJECT。（对应「不猜测」）
     闸门 2 · replay 回放（确定性）：把候选条件当作查询，回放生产检索路径的判定：
-         · pos_recall    以「生效条件」为查询 → 本节点应被召回，且不被自身负条件挡住；
+         · pos_recall    以「生效条件」为查询 → 本节点应被召回（issue #64：原式另带
+                         「负条件一票否决」因子，过严误杀共享主题词的合格负条件，
+                         已撤销——自否定职责由 no_conflict 承担）；
          · neg_separated 以「不适用条件」为查询 → 应触发条件级负路由，且负条件与正文
-                         低相关（负条件必须是「域外」的，不能把知识本身否定掉）；
+                         低相关（负条件必须是「域外」的，不能把知识本身否定掉）。
+                         ★ issue #278：该「域外」与闸门 1 的 grounding>=0.34 方向相反，
+                         二者夹出**窄缝**——负条件须「复用正文领域名词 + 换场景短语」，
+                         **完全域外会被闸门 1 丢光**（neg_dropped_all）。详见 replay_check；
          · no_conflict   生效条件与不适用条件不得互相覆盖。
        三者同时成立才算「条件稳定」。（对应「回放 / 断言 / 回归」）
+       闸门 2 前另设**负条件两态拦截**（issue #64，见 consolidate 主流程）：
+       候选未产出负条件（neg_absent）/ 负条件被 grounding 删光（neg_dropped_all）
+       → 直接 REJECT，不进 replay、不进验证单元、不落盘——「负条件被删光」不得
+       被 replay 的空集短路翻译成「通过」（否则缺「不适用条件」要素的节点仍会落盘）。
     闸门 3 · 验证单元（GLM，独立模型）：逐条核验候选是否有正文依据、负条件是否真域外。
         硬约束：**验证单元只能否决，不能新增/改写**——它没有产出权，
         否则验证环节自己就成了新的幻觉源。
@@ -82,7 +91,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import crypto, evolution, nodefile, routing
+from . import crypto, evolution, nodefile, protect, routing
 from .fsutil import append_jsonl
 from .mdcg import BUCKETED_LAYERS, bigrams, expand_query_terms_weighted
 from .readcache import direct_read
@@ -200,6 +209,13 @@ def role_config(role: str, model: str = None, base: str = None,
     凭证发到另一个厂商的网关，既必然失败又构成凭证外泄。
     """
     m_env, b_env, k_env = _ROLE_ENV[role]
+    # issue #96（2026-10-09 DSH 端）：model/base 必须先解析出，key 的**通用兜底**
+    # 才有判据可依——原实现在 key 段之后才解析 base，于是「跨厂商不回落」这条
+    # 注释里的意图无从落实。
+    model = (model or os.environ.get(m_env) or os.environ.get("MDCG_LLM_MODEL")
+             or ROLE_DEFAULT_MODEL[role])
+    base = (base or os.environ.get(b_env) or os.environ.get("MDCG_LLM_BASE")
+            or ROLE_DEFAULT_BASE[role])
     if key is None:
         key = os.environ.get(k_env)
         if key is None and role == VERIFY_ROLE:
@@ -208,13 +224,20 @@ def role_config(role: str, model: str = None, base: str = None,
                 if key:
                     break
         if key is None:
-            key = os.environ.get("MDCG_LLM_KEY")
+            # issue #96（**本条是要害**）：MDCG_LLM_KEY 是**通用**变量，实测里它
+            # 承载的是反思单元（DeepSeek）的 key。若验证单元的 base 与反思单元
+            # **不同厂商**，把该 key 发给验证网关＝**凭证外泄 + 记忆正文外发到
+            # 第二家厂商**。故此处改为：**仅在 base 同源时才允许通用兜底**。
+            _generic_ok = True
+            if role == VERIFY_ROLE:
+                _r_base = (os.environ.get(_ROLE_ENV[REFLECT_ROLE][1])
+                           or os.environ.get("MDCG_LLM_BASE")
+                           or ROLE_DEFAULT_BASE[REFLECT_ROLE])
+                _generic_ok = (base == _r_base)
+            if _generic_ok:
+                key = os.environ.get("MDCG_LLM_KEY")
         if key is None and role == REFLECT_ROLE:
             key = os.environ.get("DEEPSEEK_API_KEY")
-    model = (model or os.environ.get(m_env) or os.environ.get("MDCG_LLM_MODEL")
-             or ROLE_DEFAULT_MODEL[role])
-    base = (base or os.environ.get(b_env) or os.environ.get("MDCG_LLM_BASE")
-            or ROLE_DEFAULT_BASE[role])
     return model, base, key
 
 
@@ -284,6 +307,8 @@ def http_llm(prompt: str, model: str = None, base: str = None, key: str = None,
     max_tokens=None 走三级解析（显式 > MDCG_LLM_MAX_TOKENS > DEFAULT_MAX_TOKENS）；
     历史 bug（issue #24）：曾硬编码 1200——思考模型 reasoning 吃光预算，
     content 空串静默落成 parse_failed，离线固化 100% DEFER。
+    timeout 由调用方注入（CLI --timeout / --reflect-timeout / --verify-timeout，
+    默认 120 秒）——issue #64：此前 CLI 两 lambda 均未传，恒为硬默认、不可配。
     """
     if role:
         model, base, key = role_config(role, model, base, key)
@@ -496,26 +521,78 @@ def grounding_filter(cand: dict, body: str, thresholds: dict = None):
     return kept, detail
 
 
-# 生效条件：给定 pos_terms、neg_terms、body，返回含 pos_recall、neg_separated、no_conflict、ok 的回放判定字典。
+#: 词面覆盖率阈值（issue #278）。**本阈值现在只管 L2（与生效条件/已有知识重复），
+#: 不再管「与正文域外」** —— 修前它同时充当「负条件必须域外」的闸，与 prompt 的「邻近易混」
+#: 互斥；#278 (c) 分层后该语义移到 L2（no_conflict）。原文见下方 replay_check 内注释。
+#: 原说明：neg_separated 的「负条件与正文最大词面覆盖率」阈值。本模块自己的注释
+#: （见下方 replay_check 内 `⚠ 改 0.34 …或下面这个 0.5 都会平移窗口`）**已承认它是旋钮**，
+#: 却硬编码在函数体内 ⇒ 按库特性调参必须改源码。此处暴露为环境变量，**默认仍 0.5**
+#: （取值不变 ⇒ 行为逐位不变；只把「调参要改源码」变成「调参要设环境变量」）。
+_REPLAY_NEG_MAX_DEFAULT = 0.5
+_REPLAY_NEG_MAX_ENV = "MDCG_REPLAY_NEG_MAX_COVERAGE"
+
+
+# 生效条件：环境变量 MDCG_REPLAY_NEG_MAX_COVERAGE 可解析为正浮点时返回它，否则返回默认 0.5；
+# 不做 IO、不看库内容。
+def _neg_max_coverage() -> float:
+    """neg_separated 的覆盖率阈值（issue #278：唯一读取点）。"""
+    raw = os.environ.get(_REPLAY_NEG_MAX_ENV)
+    if raw:
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return _REPLAY_NEG_MAX_DEFAULT
+        if v > 0:
+            return v
+    return _REPLAY_NEG_MAX_DEFAULT
+
+
+# 生效条件：给定 pos_terms、neg_terms、body，返回含 pos_recall、neg_separated、no_conflict、ok 的回放判定字典；pos_recall 只认「生效条件在正文上有覆盖率」，不含负条件一票否决。
 def replay_check(pos_terms, neg_terms, body: str) -> dict:
     """回放生产判定：正例召回 + 负例剔除 + 无自相矛盾。
 
     复用 _path_semantic 的同一批原语，保证与生产路同源（P6 与真实路做一致性回归）。
+
+    issue #64（2026-10-06）：pos_recall 原式带 `and not _neg_hit(tw_pos, neg_terms)`
+    一票否决——「生效条件任一词整词出现在不适用条件里」即判负；而负条件描述的正是
+    **邻近易混情境**，与生效条件共享领域主题词是结构必然（不共享主题词就谈不上「邻近」），
+    该因子把大量合格负条件误杀为「正例召回失败」。自否定职责已由第 3 条 no_conflict
+    以覆盖率口径（<0.5 才算互相覆盖）承担——本因子与它同意图且更严，故撤销。
     """
     pos_text = " ".join(pos_terms or [])
     neg_text = " ".join(neg_terms or [])
     tw_pos = expand_query_terms_weighted(pos_text) if pos_text else {}
     tw_neg = expand_query_terms_weighted(neg_text) if neg_text else {}
 
-    # 1. 正例：以生效条件为查询，本节点正文应被命中，且不被自身负条件挡住
-    pos_recall = bool(pos_text) and _weighted_coverage(tw_pos, body) > 0.0 \
-        and not _neg_hit(tw_pos, neg_terms)
+    # 1. 正例：以生效条件为查询，本节点正文应被命中（不含负条件一票否决，见 docstring）
+    pos_recall = bool(pos_text) and _weighted_coverage(tw_pos, body) > 0.0
 
     # 2. 负例：以不适用条件为查询，应触发条件级负路由；且负条件与正文低相关
     #    （负条件必须是「域外」的，若与正文强相关，等于让知识否定自己）
+    #
+    #    ★ issue #278（c）分层后的口径：**L1 只判「是否易混」**（允许与正文共享领域词）；
+    #    `coverage < 0.5` 移到 **L2（no_conflict）**，**只管「与生效条件/已有知识重复」，
+    #    不再管「与正文域外」**。
+    #
+    #    ★ **保留下面这段「修前」记录是为留下实测依据**（否则将来有人会重新引入两闸）：
+    #    修前：负条件要同时过两道闸，方向相反，夹出一条窄缝：
+    #      闸门 1 grounding_score(neg, body) >= 0.34   ⇒ 必须**复用**正文领域名词
+    #      闸门 2 _weighted_coverage(neg, body) < 0.5  ⇒ 又不能复用**太多**
+    #    故「完全域外」（如「在 Linux 或 macOS 上部署时」）**过不了闸门 1**：
+    #    grounding=0.0 < 0.34 会被 grounding_filter 丢掉，neg 被删光 ⇒ 记
+    #    neg_dropped_all 直接 REJECT（见下方负条件两态拦截）。
+    #    可行形态是「**复用正文领域名词 + 换场景短语**」，例如
+    #    「pnpm 以外的包管理器」「不用 pnpm 的工程」（实测过两闸）。
+    #    实测窗口非空但窄：15 条候选里 5 条过两闸。
+    #    ⚠ 改 0.34（DEFAULT_GROUNDING）或下面这个 0.5 都会**平移窗口**，
+    #      二者是一对，须一起看；守卫 test_issue278_neg_window.py 钉住该窗口。
     if neg_terms:
-        neg_separated = _neg_hit(tw_neg, neg_terms) \
-            and _weighted_coverage(tw_neg, body) < 0.5
+        # ★ #278 (c) 分层 —— **L1 只判「是否易混」**：负条件词是否与本条正文的领域词有交集。
+        #   **L1 不判「是否域外」**（那是 grounding 与 no_conflict 的事）；
+        #   **L1 也不判「是否重复」**（那是 L2 = no_conflict 的事）。
+        #   修前这里还挂了 `coverage < 阈值`，与 prompt 的「邻近易混」互斥（P∧Q 无解）
+        #   ⇒ 技术类知识被系统性拒（#278 的读数）。
+        neg_separated = _neg_hit(tw_neg, neg_terms)
     else:
         neg_separated = True
 
@@ -652,7 +729,7 @@ def _apply_node(cg, e, fm: dict, content: str, kept: dict, prov: dict,
         before=before, after=evolution.state_of(cg, nid) or {})
 
 
-# 生效条件：给定 root，扫描正排层节点并执行反思→白箱闸门→验证→固化，返回报表 rep；require_verify=True 且无 verify_fn 时全部 DEFER。
+# 生效条件：给定 root，扫描正排层节点并执行反思→白箱闸门（含负条件两态拦截）→验证→固化，返回报表 rep；require_verify=True 且无 verify_fn 时全部 DEFER。
 def consolidate(root: str, layer: str = None, limit: int = None, apply: bool = False,
                 overwrite: bool = False, llm_fn=None, reflect_fn=None,
                 verify_fn=None, reflect_model: str = "", verify_model: str = "",
@@ -663,6 +740,10 @@ def consolidate(root: str, layer: str = None, limit: int = None, apply: bool = F
 
     llm_fn 是 reflect_fn 的旧名（向后兼容，单模型模式）。
     require_verify=True 且无 verify_fn → 一律 DEFER（纪律 5：未经验证不固化）。
+    白箱闸门内先过**负条件两态拦截**（issue #64）：候选未产出负条件 → reasons
+    记 neg_absent；负条件被 grounding 删光 → reasons 记 neg_dropped_all；两态
+    都直接 REJECT（不进 replay / 不进验证单元 / 不落盘）——缺「不适用条件」
+    要素的节点不得因空集短路被判「通过」。
     """
     reflect_fn = reflect_fn or llm_fn
     cg = MdCGOS(root)
@@ -728,6 +809,36 @@ def consolidate(root: str, layer: str = None, limit: int = None, apply: bool = F
         kept, gdetail = grounding_filter(cand, body, thresholds)
         pos = kept.get("生效条件") or []
         neg = kept.get("不适用条件") or []
+
+        # 2a) 负条件两态拦截（issue #64，2026-10-06）：「不适用条件」是 CCG 必需要素，
+        #     候选**未产出**（neg_absent）或**产出了但被 grounding 删光**（neg_dropped_all）
+        #     时都必须 REJECT——不进 replay、不进验证单元、不落盘。
+        #     修复前把空 neg 交给 replay_check，命中其 `else: neg_separated = True` 短路，
+        #     「负条件被删光/未产出」被翻译成「通过」，缺要素节点照常落盘并携带
+        #     verification_basis 声明（B 类实测：accepted=1/written=1，正文无
+        #     「# 不适用条件」行）。两态各自计数，便于报表区分「模型没产出」与
+        #     「产出被 grounding 判为幻觉丢弃」。
+        neg_cand = cand.get("不适用条件") or []
+        if not isinstance(neg_cand, list):
+            neg_cand = [neg_cand]
+        neg_cand = [t for t in neg_cand if str(t).strip()]
+        if not neg_cand:
+            rep["rejected"] += 1
+            _bump("neg_absent")
+            if verbose and len(rep["samples"]) < 8:
+                rep["samples"].append({"id": nid, "verdict": "REJECT",
+                                       "stage": "whitebox", "reason": "neg_absent",
+                                       "grounding": gdetail, "replay": None})
+            continue
+        if not neg:
+            rep["rejected"] += 1
+            _bump("neg_dropped_all")
+            if verbose and len(rep["samples"]) < 8:
+                rep["samples"].append({"id": nid, "verdict": "REJECT",
+                                       "stage": "whitebox", "reason": "neg_dropped_all",
+                                       "grounding": gdetail, "replay": None})
+            continue
+
         replay = replay_check(pos, neg, body)
         if not kept or not replay["ok"]:
             rep["rejected"] += 1
@@ -1329,6 +1440,22 @@ def _concept_payload(members, common_pos, neg_union):
 
 
 # 生效条件：给定 cg_or_root，从 source_layer 聚类归纳为 target_layer 概念节点，apply=True 才写盘并返回统计 rep。
+# 生效条件：e 为索引条目（可为 None）；source_layer 为空或与 e.layer 相等；且 e **不在保护面**
+# （protect.is_protected_entry：层保护 / 显式位 / 按分且来源∈{None,"hint"}）；且 e 的 tags 未命中
+# INDUCE_SKIP_TAGS —— 三条全真才返回 True（= 可进归纳候选池）。
+def pool_eligible(e, source_layer=""):
+    """归纳候选池的**过滤谓词单点**（issue #432）。
+
+    修前这段判据**内联**在 `induce_memories` 的列表推导里，且只认 `e.get("protected")` 位
+    （**窄**：漏层保护与按分保护）⇒ self/anchor 层节点入池被改写四字段、零快照零审计。
+    抽成谓词是为了**可被腿直接调用**（产出侧有多道闸——簇阈值/截断/skip-tags——谓词只有一道；
+    只从产出侧看池，变异无法闭合）。
+    """
+    e = e or {}
+    return (not source_layer or e.get("layer") == source_layer) \
+        and not protect.is_protected_entry(e)[0] \
+        and not (set(INDUCE_SKIP_TAGS) & set(e.get("tags") or []))
+
 def induce_memories(cg_or_root, source_layer="contextual", target_layer="knowledge",
                     min_cluster=INDUCE_MIN_CLUSTER, min_jaccard=INDUCE_MIN_JACCARD,
                     max_nodes=INDUCE_MAX_NODES, require_conditions=True,
@@ -1338,6 +1465,8 @@ def induce_memories(cg_or_root, source_layer="contextual", target_layer="knowled
     流程：读取源层 → bigram 相似度贪心聚类 → 提炼共同条件 → 生成概念节点
     （apply=True）→ 写 `generalizes` / `instance_of` 对称 inferred 边 → 写留痕。
 
+    issue #164：概念节点密级 = 成员最高档；任一成员密级判不了则 fail-closed
+    不生成（只留 `_maintain.jsonl` 的 sensitivity_not_judgeable 留痕）。
     apply=False（默认）只出候选报表（可预演）；apply=True 才写盘（可留痕、可回溯）。
     幂等：概念 id 由成员清单派生，同成员重复归纳不新增节点。
     """
@@ -1354,17 +1483,23 @@ def induce_memories(cg_or_root, source_layer="contextual", target_layer="knowled
         require_conditions = True
 
     nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}
-    pool = [nid for nid, e in list(nodes.items())
-            if (not source_layer or (e or {}).get("layer") == source_layer)
-            and not (e or {}).get("protected")
-            and not (set(INDUCE_SKIP_TAGS) & set((e or {}).get("tags") or []))]
+    pool = [nid for nid, e in list(nodes.items()) if pool_eligible(e, source_layer)]
     pool.sort()
     truncated = len(pool) > int(max_nodes)
     pool = pool[:int(max_nodes)]
 
+    skipped_sensitivity = 0
     cache = {}
     for nid in pool:
         got = subgraph._node_terms_and_grams(cg, nid)
+        if got and got.get("unjudgeable"):
+            skipped_sensitivity += 1
+            if apply:
+                append_jsonl(os.path.join(cg.root, MAINTAIN_LOG), {
+                    "t": time.time(), "action": "induce", "batch": None,
+                    "members": [nid], "reason": "sensitivity_not_judgeable",
+                    "actor": actor})
+            continue
         if got and got["grams"]:
             cache[nid] = got
     keys = sorted(cache.keys())
@@ -1376,6 +1511,7 @@ def induce_memories(cg_or_root, source_layer="contextual", target_layer="knowled
            "min_jaccard": float(min_jaccard),
            "require_conditions": bool(require_conditions),
            "skipped_small": 0, "skipped_no_condition": 0, "skipped_existing": 0,
+           "skipped_sensitivity": skipped_sensitivity,
            "clusters": 0, "written": 0, "concepts": [], "samples": [],
            "log": MAINTAIN_LOG}
 
@@ -1400,6 +1536,7 @@ def induce_memories(cg_or_root, source_layer="contextual", target_layer="knowled
         proposals.append({
             "members": members, "concept_id": _concept_id(members),
             "common_conditions": common_pos, "non_applicable": neg_union,
+            "sensitivity": subgraph.derive_sensitivity(cg, members),
             "reason": ("%d 条记忆内容相近且共享条件「%s」→ 归纳为概念"
                        % (len(members), "、".join(common_pos) or "无")),
         })
@@ -1422,22 +1559,46 @@ def induce_memories(cg_or_root, source_layer="contextual", target_layer="knowled
         if cid in nodes:
             rep["skipped_existing"] += 1
             continue
+        sens = p.get("sensitivity")
+        if sens is None:
+            rep["skipped_sensitivity"] += 1
+            append_jsonl(os.path.join(cg.root, MAINTAIN_LOG), {
+                "t": time.time(), "action": "induce", "batch": batch,
+                "concept": cid, "members": list(p["members"]),
+                "common_conditions": p["common_conditions"],
+                "reason": "sensitivity_not_judgeable", "actor": actor})
+            continue
         content = _concept_payload(p["members"], p["common_conditions"],
                                    p["non_applicable"])
         _consolidated_at = time.time()   # 概念形成时刻 = 巩固时刻（单一取值，禁两处取时）
         cg.add(cid, content, layer=target_layer, tags=list(CONCEPT_TAGS),
                importance=CONCEPT_IMPORTANCE, verification_basis="other",
+               sensitivity=sens,
                induced_from=list(p["members"]), induced_at=_consolidated_at,
                consolidated_at=_consolidated_at,
                induction={"method": "bigram_jaccard", "min_jaccard": float(min_jaccard),
                           "common_conditions": p["common_conditions"], "batch": batch,
                           "actor": actor, "evidence": "inferred"},
                actor=actor)
-        _link_concept(cg, cid, p["members"], p["reason"], actor, batch)
-        append_jsonl(os.path.join(cg.root, MAINTAIN_LOG), {
-            "t": time.time(), "action": "induce", "batch": batch, "concept": cid,
-            "members": list(p["members"]), "common_conditions": p["common_conditions"],
-            "source_layer": source_layer, "target_layer": target_layer, "actor": actor})
+        from . import security as _sec
+        try:
+            _high = _sec._rank(str(sens)) > _sec._rank(_sec.DEFAULT_SENSITIVITY)
+        except Exception:
+            _high = False
+        _link_reason = ("%d 条记忆内容相近 → 归纳为概念（条件词按密级留白）"
+                        % len(p["members"])) if _high else p["reason"]
+        _link_concept(cg, cid, p["members"], _link_reason, actor, batch)
+        if _high:
+            append_jsonl(os.path.join(cg.root, MAINTAIN_LOG), {
+                "t": time.time(), "action": "induce", "batch": batch, "concept": cid,
+                "members": list(p["members"]), "common_conditions": [],
+                "condition_terms_withheld": True,
+                "source_layer": source_layer, "target_layer": target_layer, "actor": actor})
+        else:
+            append_jsonl(os.path.join(cg.root, MAINTAIN_LOG), {
+                "t": time.time(), "action": "induce", "batch": batch, "concept": cid,
+                "members": list(p["members"]), "common_conditions": p["common_conditions"],
+                "source_layer": source_layer, "target_layer": target_layer, "actor": actor})
         rep["concepts"].append(cid)
         rep["written"] += 1
     if rep["written"]:
@@ -1477,9 +1638,21 @@ def _cli(argv=None) -> int:
     ap.add_argument("--min-grounding", type=float, default=None,
                     help="统一 grounding 阈值（默认按字段 0.5 / 不适用条件 0.34）")
     ap.add_argument("--max-tokens", type=int, default=None,
-                    help=f"LLM 输出预算（含思考模型 reasoning_tokens；默认 "
+                    help=f"LLM 输出预算共用缺省（含思考模型 reasoning_tokens；默认 "
                          f"{DEFAULT_MAX_TOKENS}，可 env {MAX_TOKENS_ENV} 覆盖；"
-                         "子代理配置标准 v0.5 §1）")
+                         "子代理配置标准 v0.5 §1）；两角色可分别用 "
+                         "--reflect-max-tokens / --verify-max-tokens 单设")
+    ap.add_argument("--reflect-max-tokens", type=int, default=None,
+                    help="反思单元输出预算（缺省回落 --max-tokens）")
+    ap.add_argument("--verify-max-tokens", type=int, default=None,
+                    help="验证单元输出预算（缺省回落 --max-tokens）")
+    ap.add_argument("--timeout", type=float, default=120,
+                    help="LLM HTTP 超时秒数（缺省 120）；两角色可分别用 "
+                         "--reflect-timeout / --verify-timeout 单设")
+    ap.add_argument("--reflect-timeout", type=float, default=None,
+                    help="反思单元 HTTP 超时（缺省回落 --timeout）")
+    ap.add_argument("--verify-timeout", type=float, default=None,
+                    help="验证单元 HTTP 超时（缺省回落 --timeout）")
     ap.add_argument("--no-llm", action="store_true",
                     help="不调用 LLM，只做四要素完整性普查")
     ap.add_argument("--check", action="store_true",
@@ -1530,16 +1703,28 @@ def _cli(argv=None) -> int:
                   f"（{_ROLE_ENV[REFLECT_ROLE][2]} / DEEPSEEK_API_KEY）→ 退化为普查模式",
                   file=sys.stderr)
         else:
+            # 单值 --max-tokens / --timeout 继续作两角色共用缺省；角色级参数缺省
+            # None → 回落共用缺省。issue #64：此前单值被同时喂 reflect/verify，
+            # timeout 恒为 http_llm 默认 120 不可配（生产两 lambda 均未传）——
+            # 两侧预算/超时需求可不同，须能分别单设。
+            refl_mt = (a.reflect_max_tokens if a.reflect_max_tokens is not None
+                       else a.max_tokens)
+            refl_to = (a.reflect_timeout if a.reflect_timeout is not None
+                       else a.timeout)
             reflect_fn = (lambda p: http_llm(p, role=REFLECT_ROLE,   # noqa: E731
                                              model=a.reflect_model,
-                                             max_tokens=a.max_tokens))
+                                             max_tokens=refl_mt, timeout=refl_to))
             if a.self_verify:
                 verify_fn = reflect_fn
             elif not a.no_verify:
                 if v_key:
+                    ver_mt = (a.verify_max_tokens
+                              if a.verify_max_tokens is not None else a.max_tokens)
+                    ver_to = (a.verify_timeout if a.verify_timeout is not None
+                              else a.timeout)
                     verify_fn = (lambda p: http_llm(p, role=VERIFY_ROLE,  # noqa: E731
                                                     model=a.verify_model,
-                                                    max_tokens=a.max_tokens))
+                                                    max_tokens=ver_mt, timeout=ver_to))
                 else:
                     print(f"[consolidate] 验证单元未配置 key"
                           f"（{_ROLE_ENV[VERIFY_ROLE][2]} / ZHIPU_API_KEY / GLM_API_KEY）"

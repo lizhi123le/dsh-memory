@@ -48,6 +48,11 @@ pub struct Entry {
     #[allow(dead_code)]
     pub last_access: f64,
     pub edges: Vec<String>,
+    /// 退役纪律（《秤》v2.1 §5.2；2026-10-06 接线）：索引条目的
+    /// `lifecycle_state`（对齐 `md_cg/lifecycle.py` 的 `STATE_FIELD`）。
+    /// 缺键/非 "archived" ⇒ 照常参与候选（fail-open，与 Python 侧
+    /// `lifecycle.is_archived` 同口径）；"archived" 在 `candidates` 剔除。
+    pub lifecycle_state: Option<String>,
 }
 
 /// 内存文档：`lit` 是 `positive_body(content)`；口径 A 两者恒等 → 存 `None` 省内存。
@@ -131,6 +136,11 @@ fn entry_from_json(id: &str, e: &Json) -> Entry {
         access_count: e.get("access_count").and_then(|v| v.as_f64()).unwrap_or(0.0),
         last_access: e.get("last_access").and_then(|v| v.as_f64()).unwrap_or(0.0),
         edges: extract_edges(e.get("edges")),
+        // 退役纪律：与 md_cg/lifecycle.py 的 STATE_FIELD 同键名（"lifecycle_state"）。
+        lifecycle_state: e
+            .get("lifecycle_state")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     }
 }
 
@@ -203,13 +213,29 @@ pub fn load_index(root: &Path, order: Order) -> Result<Vec<Entry>, String> {
 
     let idx_json = root.join("_index.json");
     if idx_json.is_file() {
-        let raw = std::fs::read_to_string(&idx_json)
-            .map_err(|e| format!("读 _index.json 失败: {e}"))?;
-        let j = json::parse(&raw).map_err(|e| format!("解析 _index.json 失败: {e}"))?;
-        if let Some(nodes) = j.get("nodes").and_then(|n| n.as_obj()) {
-            for (nid, ev) in nodes.iter() {
-                put(nid.clone(), entry_from_json(nid, ev), &mut map, &mut pos);
-            }
+        // issue #354 P1-8（坏件不连坐整个装载）：_index.json 读到/解析失败只降级
+        // **本源**（stderr 留痕），_index_log 分片照常重放。旧实现两处 `?` 直接把
+        // 整个装载判 Err——两个源各自独立（元数据快照 vs 增量日志），一个坏件不该
+        // 连坐另一个的可用数据。实测（修前）：坏 _index.json + 合法分片 ⇒ 进程非零
+        // 退出（「读 _index.json 失败」），分片里的节点全不可检索。
+        match std::fs::read_to_string(&idx_json) {
+            Err(e) => eprintln!(
+                "[store] _index.json 不可读，降级跳过本源（issue #354 P1-8）：{}：{e}",
+                idx_json.display()
+            ),
+            Ok(raw) => match json::parse(&raw) {
+                Err(e) => eprintln!(
+                    "[store] _index.json 解析失败，降级跳过本源（issue #354 P1-8）：{}：{e}",
+                    idx_json.display()
+                ),
+                Ok(j) => {
+                    if let Some(nodes) = j.get("nodes").and_then(|n| n.as_obj()) {
+                        for (nid, ev) in nodes.iter() {
+                            put(nid.clone(), entry_from_json(nid, ev), &mut map, &mut pos);
+                        }
+                    }
+                }
+            },
         }
     }
 
@@ -220,12 +246,32 @@ pub fn load_index(root: &Path, order: Order) -> Result<Vec<Entry>, String> {
         let mut files: Vec<PathBuf> = Vec::new();
         collect_log_files(&log_dir, &mut files);
         for f in &files {
-            let raw = match std::fs::read_to_string(f) {
-                Ok(r) => r,
-                Err(_) => continue,
+            // issue #354 P1-8（同分片内坏行不连坐好行）：分片按**字节**读 + 逐行
+            // 容错解码。旧实现 read_to_string 整片全有全无——一个坏字节（撕裂写残
+            // 字节 / 非法 UTF-8）令整分片被 continue 丢弃，其内**合法行**连同账；
+            // 分片打不开时同样只跳过该分片本身（stderr 留痕），不影响其余分片。
+            // 逐行判坏与 read_jsonl 的坏行跳过同口径（坏行作废、相邻行照常）。
+            let raw = match std::fs::read(f) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[store] _index_log 分片不可读，跳过该分片（issue #354 P1-8）：{}：{e}",
+                        f.display()
+                    );
+                    continue;
+                }
             };
-            for line in raw.lines() {
-                let line = line.trim();
+            for chunk in raw.split(|b| *b == b'\n') {
+                let chunk = match chunk.last() {
+                    // CRLF 分片（fsutil.append_jsonl 在 Windows 上写 \r\n）须剥尾 CR——
+                    // 与 str::lines 的语义一致，否则 json 解析被尾 CR 污染。
+                    Some(b'\r') => &chunk[..chunk.len() - 1],
+                    _ => chunk,
+                };
+                let Ok(s) = std::str::from_utf8(chunk) else {
+                    continue; // 非法 UTF-8 行：只作废本行（不连坐同分片其余行）
+                };
+                let line = s.trim();
                 if line.is_empty() {
                     continue;
                 }
@@ -305,6 +351,12 @@ pub fn candidates(entries: &[Entry]) -> Vec<usize> {
             if SKIP_LAYERS.contains(&e.layer.as_str()) {
                 return false;
             }
+            // 退役纪律（《秤》v2.1 §5.2；2026-10-06 接线）：archived 不进候选
+            // ——与 Python 侧 `lifecycle.is_archived` 同口径（缺键/非法=active，
+            // fail-open；converged/demoted 是降权轴，仍参与）。
+            if e.lifecycle_state.as_deref() == Some("archived") {
+                return false;
+            }
             match &e.role {
                 Some(r) => !WORK_ROLES.contains(&r.as_str()),
                 None => true,
@@ -314,9 +366,96 @@ pub fn candidates(entries: &[Entry]) -> Vec<usize> {
         .collect()
 }
 
+/// 索引条目 `path` 的物理路径 containment 闸（issue #354 P0-3）。
+///
+/// **为什么必须有**：`_index.json` 的 `path` 是跨语言文件协议输入面（任何能写库
+/// 元数据的宿主/语料都可填），而旧实现是 `root.join(path)` + 直接读盘：
+///   * 绝对路径（`D:\x` / `\\server\share` / `\x`）—— std 的 `Path::join`
+///     遇到绝对路径会**整体替换** root，不是拼接；
+///   * 相对穿越（`../x`、`a/../../x`）。
+/// ⇒ 可读库根之外任意可读文件，并把正文当节点内容回显（哨兵泄漏；本仓实测：
+/// `docs 3/3`、查询命中 `id=哨兵节点`、正文含库外哨兵串）。
+///
+/// **判据两道**（只做字符串前缀比较不够，故第二道不可省）：
+///   ① 词法层（零系统调用）：拒绝对/根相对/盘符或 UNC 前缀与 `..` 组件；
+///   ② 物理层：root 与候选路径都 `canonicalize` 后判包含——符号链接指向库外、
+///      NTFS 8.3 短名、大小写/分隔符归一这些词法看不出的形态由这道兜住。
+/// 两道都过才放行；否则**不读盘**，并按下面三类如实分类。
+enum PathGate {
+    /// 过闸：返回可读路径。
+    Allowed(PathBuf),
+    /// **确定越界**：词法层即拒（绝对/根相对/盘符前缀/.. 组件/空串/含 NUL），
+    /// 或物理层解析出库根之外（含符号链接指向库外）。
+    OutOfRoot,
+    /// 无法判定：路径不存在 / 拒绝访问 / 平台不支持 canonicalize。**不得**当成
+    /// 越界（条目指向已删除节点是本仓常见形态——「幽灵条目」），按「读不到」记。
+    Unresolvable,
+}
+
+fn resolve_in_root(root: &Path, croot: &Path, rel: &str) -> PathGate {
+    if rel.is_empty() || rel.contains('\0') {
+        return PathGate::OutOfRoot;
+    }
+    let p = Path::new(rel);
+    for c in p.components() {
+        match c {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::ParentDir => return PathGate::OutOfRoot,
+            _ => {}
+        }
+    }
+    let cand = root.join(p);
+    let Ok(ccand) = std::fs::canonicalize(&cand) else {
+        return PathGate::Unresolvable;
+    };
+    // `starts_with` 按**组件**比较，故 `<root>/../lib2` 一类的兄弟前缀不会被误判；
+    // `ccand == croot` 单列是因为 `Path::starts_with(自身)` 恒真，但显式写出更清楚。
+    if ccand == *croot || ccand.starts_with(croot) {
+        PathGate::Allowed(cand)
+    } else {
+        PathGate::OutOfRoot
+    }
+}
+
+/// 库根的**真实物理路径**（全装载只算一次）。
+/// 逐文档各调一次会把系统调用乘上语料规模；装载是每进程一次性的，但仍不值得按
+/// 文档重复（20000 文档实测规模见库内基准）。
+fn canonical_root(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// 单条目正文装载结果。
+enum DocLoad {
+    Ok(Doc),
+    /// `path` 未过 containment 闸（issue #354 P0-3）——**不读盘、不显正文**。
+    OutOfRoot,
+    /// 文件不存在 / 读失败（对齐 Python `_read` 的 `(None, None)` 口径）。
+    Unreadable,
+}
+
+/// 单文档便利入口——**仅供 crate 内单测**（生产路径走 `load_docs`：库根真实路径
+/// 在那里算一次并在线程间共享）。
+#[cfg(test)]
 fn read_doc(root: &Path, e: &Entry) -> Option<Doc> {
-    let p = root.join(&e.path);
-    let text = std::fs::read_to_string(&p).ok()?;
+    let croot = canonical_root(root);
+    match read_doc_in(root, &croot, e) {
+        DocLoad::Ok(d) => Some(d),
+        _ => None,
+    }
+}
+
+fn read_doc_in(root: &Path, croot: &Path, e: &Entry) -> DocLoad {
+    // issue #354 P0-3：containment 闸在**读盘之前**——不过闸连 open 都不发。
+    let p = match resolve_in_root(root, croot, &e.path) {
+        PathGate::Allowed(p) => p,
+        PathGate::OutOfRoot => return DocLoad::OutOfRoot,
+        PathGate::Unresolvable => return DocLoad::Unreadable,
+    };
+    let text = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(_) => return DocLoad::Unreadable,
+    };
     let (fm, content) = parse_frontmatter(&text);
 
     let id = fm.get_str("id").unwrap_or_else(|| {
@@ -385,7 +524,7 @@ fn read_doc(root: &Path, e: &Entry) -> Option<Doc> {
         Some(crate::json::Json::Bool(true))
     );
 
-    Some(Doc {
+    DocLoad::Ok(Doc {
         id,
         importance,
         tags,
@@ -404,7 +543,12 @@ fn read_doc(root: &Path, e: &Entry) -> Option<Doc> {
     })
 }
 
-/// 并行载入全部节点正文；读取失败的槽位为 `None`（对齐 `_read` 返回 (None,None)）。
+/// 并行载入全部节点正文；读取失败（含**越界被拒**）的槽位为 `None`
+/// （对齐 `_read` 返回 (None,None) 的调用方口径）。
+///
+/// issue #354 P0-3：containment 判据要用的库根真实路径在这里**算一次**并传进线程
+/// （`read_doc_in`），逐文档各 canonicalize 一次会把系统调用乘上语料规模；被拒条数
+/// 汇总成**一行** stderr 留痕（不逐条刷屏——库规模上万时逐条会淹掉日志）。
 pub fn load_docs(root: &Path, entries: &[Entry], threads: usize) -> Vec<Option<Doc>> {
     let n = entries.len();
     let mut slots: Vec<Option<Doc>> = Vec::with_capacity(n);
@@ -414,15 +558,32 @@ pub fn load_docs(root: &Path, entries: &[Entry], threads: usize) -> Vec<Option<D
     }
     let t = threads.max(1).min(n);
     let chunk = n.div_ceil(t);
+    let croot = canonical_root(root);
+    let rejected = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for (ec, sc) in entries.chunks(chunk).zip(slots.chunks_mut(chunk)) {
+            let croot = &croot;
+            let rejected = &rejected;
             scope.spawn(move || {
                 for (e, slot) in ec.iter().zip(sc.iter_mut()) {
-                    *slot = read_doc(root, e);
+                    match read_doc_in(root, croot, e) {
+                        DocLoad::Ok(d) => *slot = Some(d),
+                        DocLoad::OutOfRoot => {
+                            rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        DocLoad::Unreadable => {}
+                    }
                 }
             });
         }
     });
+    let rej = rejected.load(std::sync::atomic::Ordering::Relaxed);
+    if rej > 0 {
+        eprintln!(
+            "[store] 索引条目 path 越界被拒 {rej} 条（containment 闸，issue #354 P0-3）——库根 {}",
+            root.display()
+        );
+    }
     slots
 }
 
@@ -471,7 +632,40 @@ mod opt_batch1_tests {
             access_count: 0.0,
             last_access: 0.0,
             edges: vec![],
+            lifecycle_state: None,
         }
+    }
+
+    #[test]
+    fn archived_entries_excluded_from_candidates() {
+        // 退役纪律（2026-10-06 接线）：archived 剔除；converged/demoted（降权轴）
+        // 与缺键（active，fail-open）仍参与——两侧都要钉住（防一刀切）。
+        let mut a = entry("knowledge/a.md", "a", &[]);
+        let b = entry("knowledge/b.md", "b", &[]);
+        let mut c = entry("knowledge/c.md", "c", &[]);
+        let mut d = entry("knowledge/d.md", "d", &[]);
+        a.lifecycle_state = None;
+        c.lifecycle_state = Some("converged".to_string());
+        d.lifecycle_state = Some("demoted".to_string());
+        let mut arch = b;
+        arch.lifecycle_state = Some("archived".to_string());
+        let entries = vec![a, arch, c, d];
+        let cand = candidates(&entries);
+        assert_eq!(cand, vec![0, 2, 3],
+                   "archived 必须剔除；converged/demoted 与缺键必须保留（判据两侧）");
+    }
+
+    #[test]
+    fn lifecycle_state_parsed_from_index_json() {
+        // 走真实解析路径：键名与 md_cg/lifecycle.py 的 STATE_FIELD 同源
+        // （"lifecycle_state"）——键名漂移会被本断言钉红。
+        let j = json::parse(r#"{"path":"knowledge/x.md","layer":"knowledge",
+                               "lifecycle_state":"archived"}"#).unwrap();
+        let e = entry_from_json("x", &j);
+        assert_eq!(e.lifecycle_state.as_deref(), Some("archived"));
+        let j2 = json::parse(r#"{"path":"knowledge/y.md","layer":"knowledge"}"#).unwrap();
+        let e2 = entry_from_json("y", &j2);
+        assert_eq!(e2.lifecycle_state, None, "缺键必须是 None（fail-open 前提）");
     }
 
     #[test]

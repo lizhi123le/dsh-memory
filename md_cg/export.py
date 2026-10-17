@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 
 from .fsutil import publish
 
@@ -31,9 +32,63 @@ _ROW_KEYS = ("id", "layer", "path", "tags", "importance", "confidence",
 
 # 生效条件：给定 cg 与 kind 即返回 os.path.join(cg.root, f"export_{kind}_{当前 %Y%m%d_%H%M%S 时间戳}.jsonl")，无任何前置校验或分支。
 def _default_out(cg, kind: str) -> str:
-    """默认导出路径：`<root>/export_<kind>_<ts>.jsonl`（可搬运、可灾备）。"""
+    """默认导出路径：`<root>/export_<kind>_<ts>.jsonl`（可搬运、可灾备）。
+
+    issue #78：秒级时间戳下同秒两次导出会同名，第二次 publish 覆盖第一份快照，
+    而两个调用都返回 ok —— 静默丢数据。此处做碰撞自增：首份保持原格式不变
+    （对依赖 export_<kind>_<ts>.jsonl 精确格式的调用方零影响），仅当目标已存在
+    时追加 _1/_2… 后缀，绝不覆盖既有快照。
+    """
     ts = time.strftime("%Y%m%d_%H%M%S")
-    return os.path.join(cg.root, f"export_{kind}_{ts}.jsonl")
+    base = os.path.join(cg.root, f"export_{kind}_{ts}")
+    out = base + ".jsonl"
+    if not os.path.exists(out):
+        return out
+    for i in range(1, 10000):
+        cand = f"{base}_{i}.jsonl"
+        if not os.path.exists(cand):
+            return cand
+    return f"{base}_{int(time.time() * 1000)}.jsonl"
+
+
+# 生效条件：preferred 给定时逐个尝试 _claim_candidates(preferred) 的候选路径，对每个候选以 os.open(O_CREAT|O_EXCL|O_WRONLY) 原子创建空文件；成功即关闭句柄并返回该路径；候选被占用（FileExistsError）或不可创建（OSError）则继续下一个；全部失败时追加 uuid 段再占一次并返回。
+def _claim_candidates(preferred: str):
+    """首选名 + 让位名序列（与 _default_out 同命名口径）。"""
+    base = preferred[:-6] if preferred.endswith(".jsonl") else preferred
+    yield preferred
+    for i in range(1, 10000):
+        yield "%s_%d.jsonl" % (base, i)
+
+
+def _claim_path(preferred: str) -> str:
+    """**原子占位**：把「选路径」从查询变成内核级互斥的创建，返回本调用独占的路径。
+
+    issue #78 并发面（2026-10-09 DSH 端）：原实现只在 _default_out 里用
+    os.path.exists **先查后建**（check-then-act），两个线程可同时判定「目标不存在」
+    并选中**同一路径** ⇒ 后发布者覆盖前者，而**两次调用都返回 ok**（静默丢快照）。
+    1ceefd3f 的碰撞自增只覆盖**串行同秒**面，未覆盖该竞态。
+
+    为什么不在 _default_out 里创建：该函数已声明为**纯查询**（只探存在性、不创建
+    文件，见 test_export_default_collision.py 的 G1 口径）——在那里落文件会改掉它
+    已声明的语义，也会让「连问三次」不再是同一答案。故此处保留 _default_out 为
+    **首选名（hint）**，权威占用在本函数（真正创建文件的那一步）。
+
+    O_EXCL 由内核保证「探测 + 创建」不可分割：并发下至多一个调用者占到同一路径，
+    其余让位到 _1/_2…。占位是**空文件**，随后由 publish 原子改名覆盖为完整快照。
+    """
+    for cand in _claim_candidates(preferred):
+        try:
+            fd = os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except (FileExistsError, OSError):
+            continue
+        os.close(fd)
+        return cand
+    # 兜底：候选全满（1 万份/秒）——uuid 段保证互异，仍走原子创建
+    base = preferred[:-6] if preferred.endswith(".jsonl") else preferred
+    cand = "%s_%s.jsonl" % (base, uuid.uuid4().hex[:8])
+    fd = os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    os.close(fd)
+    return cand
 
 
 # 生效条件：cg.get(nid) 为 None 时返回 None；否则以 fm = node.get("frontmatter") or {}（缺键或假值回落空 dict）与 entry 组装行，layer 取 fm 的 layer、为假值时回落 entry.get("layer")，include_content 为真值时追加 content = node.get("content") or ""，最终只保留 _ROW_KEYS 中实际存在的键。
@@ -96,14 +151,22 @@ def _iter_entries(cg, layer=None, since=None, until=None, tag=None,
             return
 
 
-# 生效条件：将 entries 逐条经 _row 转换后写入 out_path（先 makedirs 其父目录、写 out_path + ".tmp"、结束后 os.replace 为 out_path），_row 返回 None 的条目只累加 skipped_unreadable 而不写入，其余写入并累加 written 及 by_layer（row 的 layer 缺键或假值记为 "?"）；include_content 透传给 _row 决定行是否含正文；返回含 ok/out/written/skipped_unreadable/by_layer/bytes/elapsed_ms 的统计 dict。
-def _write_jsonl(cg, out_path: str, entries, include_content: bool = True):
-    """流式写 JSONL（tmp + 原子改名）。返回统计 dict。"""
+# 生效条件：将 entries 逐条经 _row 转换后写入 out_path（先 makedirs 其父目录、写 out_path + ".<uuid>.tmp"、结束后 os.replace 为 out_path），_row 返回 None 的条目只累加 skipped_unreadable 而不写入，其余写入并累加 written 及 by_layer（row 的 layer 缺键或假值记为 "?"）；include_content 透传给 _row 决定行是否含正文；claim 为真值时先经 _claim_path(out_path) 原子占位、并以**占位到的路径**为 out_path（并发下让位到 _1/_2…），占位/发布失败时撤掉占位与临时件后抛出；返回含 ok/out/written/skipped_unreadable/by_layer/bytes/elapsed_ms 的统计 dict（out 为占位后的最终路径）。
+def _write_jsonl(cg, out_path: str, entries, include_content: bool = True,
+                 claim: bool = False):
+    """流式写 JSONL（tmp + 原子改名）。返回统计 dict。
+
+    claim=True（默认导出路径）：out_path 只是**首选名**，真正占用经 _claim_path
+    原子完成——并发调用不再取到同一路径（issue #78 并发面）。claim=False（调用方
+    显式传 out）：按原语义写到该路径（覆盖由 mcp_server 的 #85③ 护栏把关）。
+    """
     out_path = os.path.abspath(out_path)
     parent = os.path.dirname(out_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = out_path + ".tmp"
+    # issue #78 附带：tmp 加 uuid 段——两进程同时导出同一 out 时不再共用
+    # 同一个 .tmp（原实现下后写者会踩掉前者的中间态）。
+    tmp = "%s.%s.tmp" % (out_path, uuid.uuid4().hex[:8])
     written = skipped = 0
     by_layer = {}
     t0 = time.time()
@@ -119,7 +182,25 @@ def _write_jsonl(cg, out_path: str, entries, include_content: bool = True):
             by_layer[lay] = by_layer.get(lay, 0) + 1
             if written % 500 == 0:
                 f.flush()              # 定期刷盘，控制缓冲区
-    publish(tmp, out_path)             # 流式 + 原子：要么完整、要么无
+    # issue #78 并发面：**先原子占位、再发布**。占位失败/发布失败都不留垃圾。
+    claimed = None
+    if claim:
+        out_path = _claim_path(out_path)
+        claimed = out_path
+    try:
+        publish(tmp, out_path)         # 流式 + 原子：要么完整、要么无
+    except BaseException:
+        # 内容未落地：占位是本调用独占的空文件，撤掉它（别留空快照），临时件同样清掉
+        if claimed:
+            try:
+                os.remove(claimed)
+            except OSError:
+                pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return {"ok": True, "out": out_path, "written": written,
             "skipped_unreadable": skipped, "by_layer": by_layer,
             "bytes": os.path.getsize(out_path),
@@ -130,9 +211,12 @@ def _write_jsonl(cg, out_path: str, entries, include_content: bool = True):
 def export_graph(cg, out: str = None, layer=None, limit=None,
                  include_content: bool = True):
     """全库导出（默认含正文）。"""
+    # issue #78 并发面：默认名只是**首选名**，权威占用在 _write_jsonl 里原子完成
+    _claim = not out
     out = out or _default_out(cg, "graph")
     entries = _iter_entries(cg, layer=layer, limit=limit)
-    res = _write_jsonl(cg, out, entries, include_content=include_content)
+    res = _write_jsonl(cg, out, entries, include_content=include_content,
+                       claim=_claim)
     res["action"] = "graph"
     res["note"] = ("流式导出行=JSONL，一节点一行；不含索引等派生物"
                    "（删了可重建）。skipped_unreadable>0 表示有节点因密钥/越权"
@@ -146,9 +230,12 @@ def export_nodes(cg, ids, out: str = None, include_content: bool = True):
     ids = [str(i) for i in (ids or []) if str(i).strip()]
     if not ids:
         return {"ok": False, "error": "ids 不能为空"}
+    # issue #78 并发面：默认名只是**首选名**，权威占用在 _write_jsonl 里原子完成
+    _claim = not out
     out = out or _default_out(cg, "nodes")
     entries = _iter_entries(cg, ids=ids)
-    res = _write_jsonl(cg, out, entries, include_content=include_content)
+    res = _write_jsonl(cg, out, entries, include_content=include_content,
+                       claim=_claim)
     res["action"] = "nodes"
     res["requested"] = len(ids)
     res["missing"] = sorted(set(ids) - set((cg.index.get("nodes") or {}).keys()))
@@ -159,10 +246,13 @@ def export_nodes(cg, ids, out: str = None, include_content: bool = True):
 def export_slice(cg, out: str = None, layer=None, since=None, until=None,
                  tag=None, limit=None, include_content: bool = True):
     """按层 / 时间窗 / 标签切片导出（有界，便于增量搬运）。"""
+    # issue #78 并发面：默认名只是**首选名**，权威占用在 _write_jsonl 里原子完成
+    _claim = not out
     out = out or _default_out(cg, "slice")
     entries = _iter_entries(cg, layer=layer, since=since, until=until,
                             tag=tag, limit=limit)
-    res = _write_jsonl(cg, out, entries, include_content=include_content)
+    res = _write_jsonl(cg, out, entries, include_content=include_content,
+                       claim=_claim)
     res["action"] = "slice"
     res["filter"] = {"layer": layer, "since": since, "until": until, "tag": tag}
     return res
@@ -203,8 +293,25 @@ def export_stat(cg):
 
 # 生效条件：act = (action or "graph").strip().lower()（action 为 None/空串等假值时取 "graph"）——act 为 "graph"/"nodes"/"slice"/"stat" 时分别转调 export_graph/export_nodes/export_slice/export_stat（out、layer、limit、since、until、tag、ids 取自 kw 对应键，include_content 取 kw.get("include_content", True)），其它 act 值抛 ValueError。
 def run(cg, action: str = "graph", **kw):
-    """export op 唯一入口。"""
+    """export op 唯一入口。
+
+    issue #540 纵深（同族缺口）：根约束原先**只在 MCP 层**（`mcp_server._export_call`），
+    本库层入口直调时连那道闸都不存在（实测 `export.run(cg, out="\\u00a0")` 可把整库正文
+    写到数据根与白名单之外）。此处补一道**与白名单无关**的落点约束，使库层直调也受控。
+    只加拒绝分支、不新增放行：`out` 为 None/空串时行为一字不变。
+    """
     act = (action or "graph").strip().lower()
+    _out = kw.get("out")
+    if _out is not None and str(_out) != "":
+        from .security import check_export_target, check_path_root
+        _lib_root = getattr(cg, "root", None)
+        # ① 空白判据（#540）：纯空白不是「没给落点」，两道闸内部各自拒绝
+        check_path_root(_out, "MDCG_EXPORT_ROOT", "export")
+        # ② 落点约束（#211 第二道）：不得落进辅助根 / 库根危险位。
+        #    与 MCP 层 `_export_call` 同口径——**allow_overwrite=True**：覆盖与否由
+        #    调用方自己的「目标已存在 + 未显式 overwrite」判据处理（MCP 层同款），
+        #    本函数不重复实现该闸，避免把 `overwrite=True` 的合法逃生口一并拒掉。
+        check_export_target(_out, _lib_root, "export", allow_overwrite=True)
     if act == "graph":
         return export_graph(cg, out=kw.get("out"), layer=kw.get("layer"),
                             limit=kw.get("limit"),

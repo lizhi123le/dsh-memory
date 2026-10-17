@@ -78,10 +78,16 @@ mod serde_like {
         }
     }
 
+    /// 嵌套深度上限（#156⑧ · K 组 task-49）：与 swarm.rs 的 serde_json_like::MAX_DEPTH
+    /// **同值同因**——本解析器同样递归下降且无界，深嵌套请求行会让 serve 栈溢出
+    /// abort（不可捕获、整进程死）。两处解析器各自独立实现（各有历史原因：本模块
+    /// 头注「独立小实现避免循环依赖」），故上限必须**两处都补**，只补一处等于没补。
+    const MAX_DEPTH: usize = 256;
+
     pub fn parse(s: &str) -> Result<Value, String> {
         let b: Vec<char> = s.chars().collect();
         let mut i = 0usize;
-        let v = parse_value(&b, &mut i)?;
+        let v = parse_value(&b, &mut i, 0)?;
         skip_ws(&b, &mut i);
         Ok(v)
     }
@@ -92,7 +98,11 @@ mod serde_like {
         }
     }
 
-    fn parse_value(b: &[char], i: &mut usize) -> Result<Value, String> {
+    fn parse_value(b: &[char], i: &mut usize, depth: usize) -> Result<Value, String> {
+        // #156⑧：同 swarm.rs 的深度闸——超限 Err 落「解析失败」面，不放任递归。
+        if depth > MAX_DEPTH {
+            return Err(format!("嵌套过深（>{MAX_DEPTH} 层）——拒绝解析以防栈溢出"));
+        }
         skip_ws(b, i);
         match b.get(*i) {
             Some('{') => {
@@ -116,7 +126,7 @@ mod serde_like {
                                 return Err("对象缺 ':'".into());
                             }
                             *i += 1;
-                            let v = parse_value(b, i)?;
+                            let v = parse_value(b, i, depth + 1)?;
                             m.insert(k, v);
                         }
                         _ => return Err("对象结构非法".into()),
@@ -136,7 +146,7 @@ mod serde_like {
                         Some(',') => {
                             *i += 1;
                         }
-                        _ => items.push(parse_value(b, i)?),
+                        _ => items.push(parse_value(b, i, depth + 1)?),
                     }
                 }
             }
@@ -179,8 +189,35 @@ mod serde_like {
                     match b.get(i) {
                         Some('"') => out.push('"'),
                         Some('\\') => out.push('\\'),
+                        Some('/') => out.push('/'),
                         Some('n') => out.push('\n'),
                         Some('t') => out.push('\t'),
+                        // N245：与协调器写侧 `serde_json_like::escape` **同集**——
+                        // 写侧对回车产 `\r`、对 <0x20 控制字符产 `\uXXXX`（制表符
+                        // 即 `\u0009`）。此前只认 `\" \\ \n \t`：符号值含制表符时
+                        // 请求行解析失败、实例终态恒为 error，而协调器 rc=0 照发
+                        // ACK、水位照推进（静默错误）。
+                        Some('r') => out.push('\r'),
+                        Some('b') => out.push('\u{0008}'),
+                        Some('f') => out.push('\u{000c}'),
+                        Some('u') => {
+                            // \uXXXX：4 位十六进制（BMP 码点）；代理对不合成
+                            // （写侧不产，遇到即响亮报错）
+                            let hex: String = b
+                                .get(i + 1..i + 5)
+                                .map(|h| h.iter().collect())
+                                .unwrap_or_default();
+                            if hex.chars().count() != 4 {
+                                return Err("\\u 转义缺 4 位十六进制".into());
+                            }
+                            let cp = u32::from_str_radix(&hex, 16)
+                                .map_err(|_| format!("\\u 转义非法：{hex}"))?;
+                            out.push(
+                                char::from_u32(cp)
+                                    .ok_or_else(|| format!("\\u 码点非法：{hex}"))?,
+                            );
+                            i += 4; // 4 位十六进制已消费（循环末再 +1 越过末位）
+                        }
                         _ => return Err("不支持的转义".into()),
                     }
                 }
@@ -322,4 +359,59 @@ fn compose_response(
         escape_json(instance_id),
         round_no
     )
+}
+
+#[cfg(test)]
+mod escape_parity_tests {
+    //! N245 守卫：serve 的请求读侧（`serde_like::parse_str`）必须能解析协调器
+    //! 写侧（`crate::swarm::serde_json_like::escape`）产出的全部转义——旧读侧
+    //! 只认 `\" \\ \n \t`，而写侧对 <0x20 控制字符产 `\uXXXX`、对回车产 `\r`：
+    //! 载荷含制表符时请求行解析失败、实例终态恒为 error，而协调器 rc=0 照发
+    //! ACK、水位照推进（静默错误）。纯行为断言（不做源码文本匹配）。
+    use super::serde_like::{parse, Value};
+
+    const CORPUS: [&str; 6] = [
+        "甲\u{9}乙",
+        "上\r下",
+        "上\n下",
+        "\u{1}\u{1f}",
+        "引号\"与反斜杠\\",
+        "中文，破折——",
+    ];
+
+    #[test]
+    fn request_line_written_by_coordinator_is_parseable() {
+        for s in CORPUS {
+            // 与 run_round 组装的请求同构：symbols 对象内嵌写侧 escape 的产出
+            let line = format!(
+                "{{\"symbols\":{{\"收件箱\":\"{}\"}},\"trust\":0.0}}",
+                crate::swarm::serde_json_like::escape(s)
+            );
+            let v = parse(&line)
+                .unwrap_or_else(|e| panic!("serve 读侧无法解析写侧产出：{e}（{line:?}）"));
+            let mut got = None;
+            if let Value::Obj(m) = &v {
+                if let Some(Value::Obj(sm)) = m.get("symbols") {
+                    if let Some(Value::Str(x)) = sm.get("收件箱") {
+                        got = Some(x.clone());
+                    }
+                }
+            }
+            assert_eq!(got.as_deref(), Some(s), "往返不等：{s:?} → {line:?}");
+        }
+    }
+
+    /// #156⑧ 守卫（K 组 · task-49）：本模块的请求读侧**同样**是递归下降（与 swarm.rs
+    /// 的 serde_json_like 是两份独立实现），故上限必须**两处都补**——只补一处等于没补。
+    /// 深嵌套请求行必须得到 Err 而不是把 serve 的栈吃穿（栈溢出 = 整进程 abort）。
+    #[test]
+    fn deep_nesting_is_rejected_not_aborting() {
+        let deep = format!("{}{}{}", "[".repeat(5000), "1", "]".repeat(5000));
+        match parse(&deep) {
+            Err(e) => assert!(e.contains("嵌套过深"), "拒绝原因须可读（点名嵌套过深）：{e}"),
+            Ok(_) => panic!("深嵌套未被拒绝（递归无上限 ⇒ serve 栈溢出 abort）"),
+        }
+        let shallow = format!("{}{}{}", "[".repeat(100), "1", "]".repeat(100));
+        assert!(parse(&shallow).is_ok(), "上限内结构被误拒（上限过紧）");
+    }
 }

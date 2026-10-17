@@ -10,10 +10,31 @@ AST（protocol-compiler parser）→ VM 指令（condition_vm）：
 若则=if——VM 执行结果与声明语义一致。
 """
 
+import math
+
 from .lexer import tokenize, TokenType
 from .parser import parse_tokens, NodeType
 from .name_checker import NameChecker
 from .condition_vm import Opcode
+
+
+def _finite_operand(val, line, what):
+    """数值操作数闸（单点）：非数值或非有限值 ⇒ SyntaxError 名实不符。
+
+    issue #435：float('inf') / float('nan') 是合法转换、不抛异常，故单靠
+    try/except 拦不住——「必须是数值」的闸会被穿透，而它们进信任寄存器后
+    永久毒化且不报错（NaN 破坏相等自反 ⇒「止」永不触发；inf 恒超任何阈值
+    ⇒「知足」恒早退）。故此处按「有限」判定，与「名实不符」同一口径拒绝。
+    """
+    try:
+        num = float(val) if val is not None else 0.0
+    except (TypeError, ValueError):
+        raise SyntaxError(
+            f"L{line} {what} 的操作数必须是数值，得到 '{val}'（名实不符）")
+    if not math.isfinite(num):
+        raise SyntaxError(
+            f"L{line} {what} 的操作数必须是有限数值，得到 '{val}'（名实不符）")
+    return num
 
 
 # 中文比较词 → VM 比较指令（codegen CHINESE_COMP_MAP 同构）
@@ -169,7 +190,7 @@ class Compiler:
             self.warnings.append(f"L{s.line} 未编译语句类型: {s.type.name}")
 
     # ---- 道德经指令 ----
-# 生效条件：按 s.instruction 分派——DAO 发 (DAO, val)，val 为 None（operands 为空或 _operand_value 返回 None）时用 '无名路径'；DE 发 float(val)，val 为 None 时 0.0、非数值时抛 SyntaxError 名实不符；ZIRAN/WUWEI/ZHI 各发对应无参指令；ZHIZU 以 float(val)（None 时 0.0）为阈值新建标签并挂 pending 与 zhizu_labels；其余指令向 warnings 追加未接入提示。
+# 生效条件：按 s.instruction 分派——DAO 发 (DAO, val)，val 为 None（operands 为空或 _operand_value 返回 None）时用 '无名路径'；DE 发 float(val)，val 为 None 时 0.0、非数值时抛 SyntaxError 名实不符；ZIRAN/WUWEI/ZHI 各发对应无参指令；ZHIZU 以 float(val)（None 时 0.0）为阈值新建标签并挂 pending 与 zhizu_labels，非数值操作数同 DE 口径抛 SyntaxError 名实不符（issue #434，裸 float 不再穿透编译主入口）；其余指令向 warnings 追加未接入提示。
     def _instr(self, s):
         op = s.instruction
         operands = s.operands
@@ -177,12 +198,7 @@ class Compiler:
         if op == TokenType.DAO:
             self._emit(Opcode.DAO, val if val is not None else "无名路径")
         elif op == TokenType.DE:
-            try:
-                self._emit(Opcode.DE, float(val) if val is not None else 0.0)
-            except (TypeError, ValueError):
-                # 以名举实：非数值操作数（未声明标识符）编译期拦截——名实不符
-                raise SyntaxError(
-                    f"L{s.line} 德 的操作数必须是数值，得到 '{val}'（名实不符）")
+            self._emit(Opcode.DE, _finite_operand(val, s.line, '德'))
         elif op == TokenType.ZIRAN:
             self._emit(Opcode.ZIRAN)
         elif op == TokenType.WUWEI:
@@ -190,7 +206,9 @@ class Compiler:
         elif op == TokenType.ZHI:
             self._emit(Opcode.ZHI)
         elif op == TokenType.ZHIZU:
-            threshold = float(val) if val is not None else 0.0
+            # issue #434：非数值阈值转结构化 SyntaxError（compile_source 已窄捕）；
+            # issue #435：同口径拦 inf/nan。两处判据收口在 _finite_operand 单点。
+            threshold = _finite_operand(val, s.line, '知足')
             lbl = self._new_label()
             self._emit(Opcode.ZHIZU, (threshold, lbl))
             self.pending.append((len(self.code) - 1, lbl))
@@ -237,15 +255,31 @@ class Compiler:
         else:
             self.warnings.append(f"L{e.line} 未编译表达式: {e.type.name}")
 
-# 生效条件：先对 e.args 逐个求值入栈；若 e.name 不在 self.funcs 则向 warnings 追加未定义函数并返回（不发 CALL），否则发 CALL (entry_lbl, params) 并挂 pending。
+# 生效条件：先对 e.args 逐个求值入栈；e.name 不在 self.funcs 时抛 SyntaxError('未定义函数')，在 self.funcs 但 len(e.args) 与形参表不等时抛 SyntaxError('实参个数不符')（两情形均不产出字节码，由 compile_source 窄捕获后返回 ok=False），否则发 CALL (entry_lbl, params) 并挂 pending。
     def _call_expr(self, e):
         """函数调用编译：实参求值入栈 → CALL (入口, 参数名)"""
         for a in e.args:
             self._expr(a)
         if e.name not in self.funcs:
-            self.warnings.append(f"L{e.line} 未定义函数 '{e.name}'（调用悬空）")
-            return
+            # N236：未定义函数由 warning 升为编译期错误。此前仅记警告且
+            # 不发 CALL——实参已入栈却无消费，产物残缺（如
+            # [STORE_NAME 甲]），VM 执行 STORE_NAME 时 pop 空栈裸穿
+            # IndexError（run 仅捕 VMHalt/MemoryError）。抛 SyntaxError
+            # 使 strict=False（pbc 等入口）不再产出残缺字节码。
+            raise SyntaxError(
+                f"L{e.line} 未定义函数 '{e.name}'（调用悬空——以名举实："
+                f"调用前须先「定义 {e.name}（…）」）")
         entry_lbl, params = self.funcs[e.name]
+        if len(e.args) != len(params):
+            # N237：实参条数与形参表不符同样致命——少参使 VM 的 CALL 按
+            # len(param_names) 连续 pop（condition_vm.py:361-366），栈内不足
+            # 即 IndexError；多参使多余实参永久残留值栈（静默语义错）。
+            # 同一既有判据处（N236 的函数存在性检查）追加条数比对，
+            # 使 strict=False（pbc 等入口）亦不产出错配字节码。
+            raise SyntaxError(
+                f"L{e.line} 函数 '{e.name}' 实参个数不符：定义 {len(params)} 个"
+                f"形参（{'、'.join(params) if params else '无'}），"
+                f"调用提供 {len(e.args)} 个（以名举实）")
         self._emit(Opcode.CALL, (entry_lbl, params))
         self.pending.append((len(self.code) - 1, entry_lbl))
 

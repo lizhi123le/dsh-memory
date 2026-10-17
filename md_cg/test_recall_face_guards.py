@@ -641,10 +641,19 @@ _MUTATIONS = {
         "mdcg.py", r"(?m)^NEG_COVERAGE_SCORE = 0\.0\s*$",
         "NEG_COVERAGE_SCORE = 1.0", ["N1", "N2", "N2b", "N5"],
         "提示条目分数退回 1.0（改动前：高过任何真实候选）"),
-    "H10-kbudget": (
-        "mdcg.py", r"(?m)^\s*return max\(0, int\(k\) - int\(n_tail\)\)\s*$",
-        "        return max(0, int(k))", ["N3"],
-        "主结果退回 scored[:k]（尾巴在 k 之外 → 结果数 k+3）"),
+    # H10 修订（2026-10-07）后，k 预算的裁决点从「`_primary_slots` 一律让位给
+    # min(3,k) 条提示」改为「真实命中先占满 min(k, 真实命中数)，提示才是余下位子」。
+    # 故本条变异改成新单点：把「真实命中数」恒取 k（提示条恒不出现 → 负覆盖信号
+    # 在结果面静默消失）——N 组现场（2 真命中 + 2 负节点）能判别它。
+    # 旧变异「`_primary_slots` 退回 scored[:k]（尾巴在 k 之外 → len > k）」在本组
+    # 现场（scored 短于 k）已**不可观测**（结果数不会超 k 是因为候选本就少），
+    # 其判别力属「len(scored) ≥ k 而真命中 < k」的 T3 全量兜底形态——已移到
+    # `md_cg/test_neg_coverage_budget.py`（B3b，定点变异 primary-slots-no-budget）。
+    "H10-real-first": (
+        "mdcg.py",
+        r"(?m)^\s*_n_real = min\(max\(0, int\(k\)\), sum\(1 for _, s in scored if s > 0\)\)\s*$",
+        "        _n_real = max(0, int(k))", ["N0", "N2b", "D0", "D2"],
+        "真实命中数恒取 k（提示条恒不出现：负覆盖提示在结果面静默失传）"),
     "H10-ddenom": (
         "mdcg.py",
         r"(?m)^\s*cands = \[r for r in results if not _is_neg_coverage\(r\[0\]\)\]\s*$",
@@ -670,7 +679,14 @@ _MUTATIONS = {
     "H11-slug": (
         "mdcg.py", r"(?m)^\s*return _tasks\.slugify\(raw\)\s*$",
         "        return hashlib.sha1(str(question or \"\").encode()).hexdigest()[:10]",
-        ["S1", "S3"], "工单身份退回内容哈希（措辞一变就另建一张）"),
+        # issue #206 C3（2026-10-13 DSH 端）：期望集补 S4。原写 ["S1","S3"]，
+        # 而该变异**因果上**必然连带打红 S4——身份退回内容哈希后，同一问题
+        # 的新现场算出的 id 与旧工单不同，_refresh_unresolved 找不到同一张单，
+        # 于是**新建**而不是就地刷新，旧数值留在旧单里 ⇒ S4「旧数值不残留」
+        # 必然失败。这不是判据过宽，而是期望集漏列了这条因果链。
+        # 该漏列此前**不可见**：_reds_exact 的返回值被取反绑定（同 C3），
+        # 该变异一直走 else 分支被静默判 ok；绑定修正后才如实报「多打红 S4」。
+        ["S1", "S3", "S4"], "工单身份退回内容哈希（措辞一变就另建一张）"),
     "H11-refresh": (
         "mdcg.py", r"(?m)^\s*fm, old = self\._read\(entry\)\s*$",
         "        return False\n        fm, old = self._read(entry)", ["S4"],
@@ -693,6 +709,25 @@ def _reds(stdout):
         if m:
             out.append(m.group(1))
     return out
+
+
+def _reds_exact(reds, want):
+    """变异红项的**精确**判据（issue #182）：与孪生守卫
+    `md_cg/test_c8_search_rrf_gates.py` 的 `len(reds) == expect` 同形——
+    reds 必须与期望红项集**完全相等**：多打红的（该处变异打红的面比预期更宽）
+    与未打红的同样判失败；只做包含判据会把前者静默吞掉。
+
+    返回 (是否通过, 不相等处的明细)。
+    """
+    ok = (set(reds) == set(want))
+    missing = sorted(set(want) - set(reds))
+    extra = sorted(set(reds) - set(want))
+    why = []
+    if missing:
+        why.append("未打红预期断言：%s" % " ".join(missing))
+    if extra:
+        why.append("多打红非预期断言：%s" % " ".join(extra))
+    return ok, "；".join(why) or "（红项与预期逐项一致）"
 
 
 def _md5(path):
@@ -744,7 +779,13 @@ def _mutate_mode(which):
                 f.write(re.sub(pat, sub, src, count=1))
             r = _run_guard(tmp)
             reds = _reds(r.stdout)
-            missed = [w for w in want if w not in reds]
+            # issue #206 C3（2026-10-13 DSH 端）：变量名**取反绑定**的修正。
+            # _reds_exact 返回 (是否通过, 明细)，此处原写作 missed, why = ...，
+            # 于是下文的 elif missed: 实际判的是 **ok 为真**——判据**满足**被当
+            # 失败（打印 FAIL 却在理由里写「红项与预期逐项一致」），判据**违反**
+            # 则落到 else 分支被静默通过。一个绑定错误同时产生假红与假绿。
+            # 这正是 issue #206 §C3 报的形态，实测 9 处变异 8 处 FAIL。
+            same, why = _reds_exact(reds, want)
             summary = [l for l in (r.stdout or "").splitlines()
                        if l.startswith("====")]
             print("  [%s] %s" % (name, note))
@@ -757,8 +798,9 @@ def _mutate_mode(which):
                       % (name, r.returncode))
                 print("     stderr: %s" % (r.stderr or "")[-400:])
                 rc = 1
-            elif missed:
-                print("  FAIL 变异 %s 未打红预期断言：%s" % (name, missed))
+            elif not same:
+                print("  FAIL 变异 %s 红项与预期**不相等**：%s"
+                      % (name, why))
                 rc = 1
             else:
                 print("  ok   变异 %s 打红预期断言 %d 项" % (name, len(want)))

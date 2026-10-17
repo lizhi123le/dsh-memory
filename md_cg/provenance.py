@@ -144,7 +144,13 @@ def append(root: str, edges, *, path: str = None) -> int:
         os.makedirs(os.path.dirname(os.path.abspath(p)) or ".", exist_ok=True)
         with FileLock(p, timeout=_LOCK_TIMEOUT):
             for e in edges:
-                append_jsonl(p, e)
+                # #326-④：append_jsonl 不再上抛 OSError（改返回布尔）——本处是
+                # **fail-closed**（写失败必须报 ProvenanceError），故必须读返回值，
+                # 否则「写失败」会静默变成「写成功」（修前由 except OSError 兜住）。
+                if append_jsonl(p, e) is False:
+                    raise ProvenanceError(
+                        f"派生台账写入失败：{p}（append_jsonl 返回 False，"
+                        f"源头已记 fsutil.APPEND_FAILURES）")
     except OSError as exc:
         raise ProvenanceError(f"派生台账写入失败：{p}（{exc}）") from exc
     return len(edges)
@@ -431,7 +437,7 @@ def _node_digest(cg, nid) -> dict:
     N226（2026-09-28）：此前直读 `cg.index` 无可见性判定 ⇒ 端点摘要（layer/
     tags/importance/writer/session/temporal）把读闸拒绝节点的元数据照返回
     （实测 guest 经 `cg(op="edges", expand_nodes=true)` 拿到私密节点摘要）。
-    同库同身份的 `stg.timeline`（stg.py:133/172）早已接线 `_readable`——本处
+    同库同身份的 `stg.timeline`（stg.py:144/238）早已接线 `_readable`——本处
     是漏网的旁路出口，改为同一个跨层单点（`security.node_visible`）。
     """
     nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}

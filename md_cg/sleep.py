@@ -31,12 +31,18 @@
 
 四阶段（§4.4）里本模块的落点：
 
-    ① 物化   `materialize()`          —— 持根级锁；主库真源面逐字节不变
+    ① 物化   `materialize()`          —— 持根级锁；挂上影子即成功（`ok=True`）；
+                                       真源面在窗口内漂移只记 `face_stable=False`，
+                                       **不阻断迭代**（漂移交 ③ 的并发闸按「主库
+                                       优先」逐项处置——issue #60）
     ② 迭代   （P1；在影子上跑，本模块不管）
     ③ 对账+提交 `reconcile_and_commit()` —— 持根级锁；Δ 为空即零提交零写入
     ④ 合并   `merge()`                —— 持根级锁；写主库的正是「应写的那部分」
 
-脚本式用法（只读判读）：`python -X utf8 -m md_cg.sleep --status`
+脚本式用法：`python -X utf8 -m md_cg.sleep --status`（只读判读，含上一轮读数）｜
+            `--once`（立即跑一轮，不等常驻 tick，同样过四道门）｜
+            `--once --dry-run`（只预览：跑盘点与四道门，不物化、不记账）｜
+            `--audit`（只跑两条机械判据）
 """
 from __future__ import annotations
 
@@ -58,6 +64,15 @@ from .mdcg import LAYERS
 SLEEP_DIRNAME = "sleep"
 GITDIR_DIRNAME = "lib.git"
 SHADOW_DIRNAME = "shadow"
+#: 记忆根绑定标记（lib.git 目录内，**不进版本库、不进工作树**）：内容为该
+#: lib.git 所服务记忆根的 realpath。issue #295：lib.git / 影子落在**用户级
+#: 状态根**下、与 MDCG_ROOT 无关，同一 state_root 下两个记忆根共用一份版本库
+#: ⇒ A 根入册的层文件一直留在 HEAD（空层被 pathspecs 滤掉、删除记不进去），
+#: B 根下一轮从该 HEAD fork，把 A 的文件判成「影子侧新增」重放进 B 根——
+#: 跨租户可读、同 id 节点被顶替删除。
+ROOT_MARKER = "mdcg-root"
+#: 多根共存时按根分槽的父目录名（`<state_root>/sleep/roots/<sha256[:16]>/`）。
+ROOTS_DIRNAME = "roots"
 #: 根级锁文件名（`FileLock` 会再拼 `.lock`）——即 `<state_root>/sleep/sleep.lock`。
 LOCK_NAME = "sleep"
 #: 基线分支与影子分支前缀（§4.1：分支名 `sleep/<时间戳>`）。
@@ -68,7 +83,23 @@ GIT_USER_EMAIL = "sleep@lingshu.local"
 #: 历史里**零命中**才合规的禁入路径（§4.5 机械判据）。
 FORBIDDEN_BASENAMES = ("_keys.json", "_access.log", "_index.json")
 FORBIDDEN_SUFFIXES = (".tmp", ".lock")
+#: #405：原子写临时件的**真实**形态是 `.<name>.md.tmp-<rand>`（`.tmp-` 是**中缀**而非后缀），
+#: 而 §4.5 判据一原用 `endswith` 判 ⇒ 对真实临时件**零命中**（同一份历史里老式 `junk.tmp`
+#: 被命中、`.n_a.md.tmp-k1lled` 漏报，两条机械判据同时报绿）。故补中缀判据（同一单点内）。
+FORBIDDEN_INFIXES = (".tmp-", ".lock-")
 DEFAULT_LOCK_TIMEOUT = 30.0
+#: 单条 git 子进程的**硬超时**（秒）——issue #63 主修（单点可调）。
+#: 取值依据：本机 git 操作为秒级（init / add / commit / rev-parse / worktree /
+#: merge / revert 全是单库本地动作），120s 为安全上界；超时即 kill
+#: （`subprocess.run(timeout=)` 语义）；残留锁处置见 `_clear_git_lock`
+#: （有界自清，2026-10-06 落地原「是否自动清理」待裁项）。
+_GIT_TIMEOUT_S = 120
+#: git 超时被 kill 后可能的残留锁名（有界自清的**唯一**对象名）。
+_GIT_LOCK_NAME = "index.lock"
+#: 残留锁的**超龄阈值**（秒）——有界自清的第二闸：本模块全部 git 调用都带
+#: `_GIT_TIMEOUT_S` 超时，合法操作结构性不可能持锁超过它；300s（≈2.5×）之上
+#: 仍存在的锁只可能是崩溃/被 kill 的残留。
+_GIT_LOCK_STALE_S = 300
 #: 睡眠轮次的**台账**（append-only JSONL）——落 `sleep_root()` 侧（状态面，
 #: **不是数据根**）：台账是运行态，不该成为真源面的一部分、也不该进版本库。
 SLEEP_LEDGER = "_sleep.jsonl"
@@ -108,6 +139,16 @@ SLEEP_MERGE_MODES = ("auto", "ask", "never")
 
 class SleepError(Exception):
     """git 操作失败（带 stderr 摘要）。"""
+
+
+class SleepGitTimeout(SleepError):
+    """git 子进程**超时已被 kill**（issue #63）——与「git 返回非零」区分。
+
+    为什么单列一支：超时与普通失败的处理面不同——普通失败（rc≠0）是 git
+    对本次操作的裁决（冲突 / 非法状态），超时是**本次操作没有完成**（可能
+    留下半成品与残留锁），台账文案必须能分开（物化超时 vs 物化失败）。
+    `SleepError` 的子类 ⇒ 所有既有 `except SleepError` 面照旧收得住。
+    """
 
 
 # 生效条件：name 为 SLEEP_ENV_DEFAULTS 的键时，按 SLEEP_ENV_KEYS[name] 从 environ（缺省 os.environ）取名取值，缺键（None）时回落真源缺省；返回**原始字符串**（不做 bool/float 解释——解释归各具名包装）。name 非表内键时抛 KeyError（不做静默回落：拼错键名即编程错误）。
@@ -159,18 +200,83 @@ def sleep_root() -> str:
     return os.path.join(state_root(), SLEEP_DIRNAME)
 
 
-# 生效条件：explicit 非空时经 abspath 归一返回；否则取 env MDCG_SLEEP_GITDIR（非空）经 abspath 返回；两者皆空时返回 sleep_root() 下 "lib.git" 的拼接路径。不触盘、不建目录。
-def git_dir(explicit: str = None) -> str:
-    """独立 git 目录（§4.7 `MDCG_SLEEP_GITDIR`；缺省 `state_root()/sleep/lib.git`）。"""
+# 生效条件：explicit 非空时经 abspath 归一返回；否则取 env MDCG_SLEEP_GITDIR（非空）经 abspath 返回；两者皆空且 root 非空时返回 `_slot_root(root)` 下 "lib.git"（issue #295 按根分槽）；root 也为空时返回 sleep_root() 下 "lib.git" 的拼接路径（旧行为逐字不变）。不触盘、不建目录。
+def git_dir(explicit: str = None, root: str = None) -> str:
+    """独立 git 目录（§4.7 `MDCG_SLEEP_GITDIR`；缺省 `state_root()/sleep/lib.git`）。
+
+    issue #295：传 root 时落点按根分槽（见 `_slot_root`）——同一 state_root 下
+    第二个记忆根不再共用第一根的 lib.git；不传 root 时返回值与修前逐字相同。
+    """
     v = explicit or sleep_env("gitdir")     # 键名/缺省的真源 = SLEEP_ENV_KEYS 表
-    return os.path.abspath(v) if v else os.path.join(sleep_root(), GITDIR_DIRNAME)
+    if v:
+        return os.path.abspath(v)
+    if root:
+        return os.path.join(_slot_root(root), GITDIR_DIRNAME)
+    return os.path.join(sleep_root(), GITDIR_DIRNAME)
 
 
-# 生效条件：explicit 非空时经 abspath 归一返回；否则取 env MDCG_SLEEP_SHADOW（非空）经 abspath 返回；两者皆空时返回 sleep_root() 下 "shadow" 的拼接路径。不触盘。
-def shadow_dir(explicit: str = None) -> str:
-    """影子工作树落点（§4.7 `MDCG_SLEEP_SHADOW`；缺省 `state_root()/sleep/shadow`）。"""
+# 生效条件：explicit 非空时经 abspath 归一返回；否则取 env MDCG_SLEEP_SHADOW（非空）经 abspath 返回；两者皆空且 root 非空时返回 `_slot_root(root)` 下 "shadow"（issue #295 按根分槽）；root 也为空时返回 sleep_root() 下 "shadow" 的拼接路径（旧行为逐字不变）。不触盘。
+def shadow_dir(explicit: str = None, root: str = None) -> str:
+    """影子工作树落点（§4.7 `MDCG_SLEEP_SHADOW`；缺省 `state_root()/sleep/shadow`）。
+
+    issue #295：传 root 时与 `git_dir` 同槽按根分开；不传 root 时返回值与修前逐字相同。
+    """
     v = explicit or sleep_env("shadow")     # 键名/缺省的真源 = SLEEP_ENV_KEYS 表
-    return os.path.abspath(v) if v else os.path.join(sleep_root(), SHADOW_DIRNAME)
+    if v:
+        return os.path.abspath(v)
+    if root:
+        return os.path.join(_slot_root(root), SHADOW_DIRNAME)
+    return os.path.join(sleep_root(), SHADOW_DIRNAME)
+
+
+# 生效条件：git_dir_path 下存在可读的 ROOT_MARKER 且首行非空时返回其 realpath；
+# 目录/标记缺失或不可读时返回 ""（未绑定）。不触盘创建任何东西。
+def bound_root(git_dir_path: str) -> str:
+    """lib.git 绑定的记忆根（未绑定返回空串）。"""
+    try:
+        with open(os.path.join(git_dir_path, ROOT_MARKER),
+                  encoding="utf-8") as f:
+            v = f.readline().strip()
+    except OSError:
+        return ""
+    return os.path.realpath(v) if v else ""
+
+
+# 生效条件：git_dir_path 已绑定且绑定根 ≠ realpath(root) 时返回中文原因串；
+# 未绑定、绑定本根或标记不可读时返回 ""。
+def _bind_error(git_dir_path: str, root: str) -> str:
+    owner = bound_root(git_dir_path)
+    if owner and owner != os.path.realpath(root):
+        return ("lib.git %s 绑定的是另一个记忆根 %s（本根 %s）——"
+                "每个记忆根须用各自的 lib.git / 影子（issue #295）"
+                % (git_dir_path, owner, os.path.realpath(root)))
+    return ""
+
+
+# 生效条件：git_dir_path 为已存在的目录且未绑定时写入 ROOT_MARKER
+# （realpath(root)）并返回 True；已绑定（含本根）时不动盘、返回 False。
+def _bind_root(git_dir_path: str, root: str) -> bool:
+    if bound_root(git_dir_path):
+        return False
+    with open(os.path.join(git_dir_path, ROOT_MARKER), "w",
+              encoding="utf-8") as f:
+        f.write(os.path.realpath(root) + "\n")
+    return True
+
+
+# 生效条件：root 为记忆根路径时返回本根该用的落点父目录——缺省 lib.git 不存在、
+# 未绑定或绑定本根时为 sleep_root()（单根安装路径逐字不变）；已绑定别的根时为
+# sleep_root()/roots/<sha256(realpath(root))[:16]>。**须在根级锁内调用**：
+# 两个根同时首轮时，后到者靠先到者写下的绑定才能分到自己的槽。
+def _slot_root(root: str) -> str:
+    """按根分槽（issue #295）：返回 `lib.git` / `shadow` 的父目录。"""
+    legacy = os.path.join(sleep_root(), GITDIR_DIRNAME)
+    if (not os.path.isdir(legacy)
+            or bound_root(legacy) in ("", os.path.realpath(root))):
+        return sleep_root()
+    key = hashlib.sha256(os.path.realpath(root).encode(
+        "utf-8", "surrogateescape")).hexdigest()[:16]
+    return os.path.join(sleep_root(), ROOTS_DIRNAME, key)
 
 
 # 生效条件：无入参；恒返回 sleep_root() 下 "sleep" 的拼接路径（`FileLock` 会再拼 ".lock"，即 <state_root>/sleep/sleep.lock）。**绝不在数据根内**——锁件进不了真源面，也进不了版本库白名单。
@@ -207,6 +313,32 @@ def worktree_git_dir(shadow: str) -> str:
 
 
 # 生效条件：root 为目录路径时返回 8 个 LAYERS 目录中**盘上存在且其下至少有一个文件**者的目录名列表（顺序同 LAYERS）；root 下无任何命中时返回空列表。只 walk 目录、不读文件内容，命中即 break。
+# 生效条件：root 下各层中含 .md 者，返回 [":(glob)<层>/**/*.md", ...]（add 的**真源面 pathspec 单点**）；无 .md 的层不返回；root 非目录返回 []。
+def add_pathspecs(root: str) -> list:
+    """`git add` 的 pathspec **单点**（#405）：只入册真源面 `.md`。
+
+    #405 根因：`_stage_and_commit` 原把 `pathspecs(root)`（**层目录名**）当 pathspec 用，
+    而 `git add -- <层名>` 会暂存该目录下**任何**未跟踪/已修改文件——层目录内的运行态、
+    原子写临时件（`.<name>.md.tmp-<rand>`）、手工投放件都会进 `lib.git` **不可逆历史**
+    （真库只读取证：29726 条历史路径里 3 条非 .md，全部是这种临时件）。
+    本形态与 #145 的既定口径一致（文件 glob，注释逐字「不含 .tmp/.lock 等」）。
+
+    **为什么不改 `pathspecs()` 的返回形态**：既有裁定 `test_sleep.py:220` 钉住它返回
+    **层名**，且 `_stage_and_commit` 的 stale 分支需要层名做「整层清索引」⇒ 本件只让
+    **add** 收窄（修改既有裁定不是修复该做的事）。
+    """
+    out = []
+    for layer in LAYERS:
+        base = os.path.join(root, layer)
+        if not os.path.isdir(base):
+            continue
+        for _dp, _dn, files in os.walk(base):
+            if any(f.endswith(".md") for f in files):
+                out.append(":(glob)%s/**/*.md" % layer)
+                break
+    return out
+
+
 def pathspecs(root: str) -> list:
     """`add` 的**显式 pathspec 白名单**：`md_cg.mdcg.LAYERS` 中盘上非空者。
 
@@ -259,23 +391,93 @@ def face_delta(before: dict, after: dict) -> dict:
                               if before[k] != after[k])}
 
 
-# 生效条件：git_dir_path 与 work_tree 给定时以 ["git", "--git-dir=<git_dir_path>", "--work-tree=<work_tree>", *args] 调 subprocess.run（capture_output + text + 显式 utf-8/errors=replace + env 带 PYTHONUTF8=1 + shell=False）并返回 CompletedProcess；returncode 非零不抛（由调用方判）。
+# 生效条件：git_dir_path 与 work_tree 给定时以 ["git", "--git-dir=<git_dir_path>", "--work-tree=<work_tree>", *args] 调 subprocess.run（capture_output + text + 显式 utf-8/errors=replace + env 带 PYTHONUTF8=1 + shell=False + **timeout=_GIT_TIMEOUT_S** + **stdin=DEVNULL**）并返回 CompletedProcess；returncode 非零不抛（由调用方判）；TimeoutExpired **不吞**——单点转 SleepGitTimeout（消息含「超时（_GIT_TIMEOUT_S）已被 kill」+ 命令名 + 残留锁人工核删指引）。
+# 生效条件：git_dir_path 下存在 index.lock 且（force 为真 或 其 mtime 距今 ≥ _GIT_LOCK_STALE_S 秒）时删除该文件、记一行 `git_lock_cleared` 台账（写入失败不阻断）并返回 "cleared"；锁不存在返回 "absent"；存在但未达清理条件、或删除失败（OSError）返回 "left"（保持既有的人工核删指引面）。
+def _clear_git_lock(git_dir_path: str, *, force: bool = False) -> str:
+    """有界自清影子仓的 git 残留锁（三闸口径，2026-10-06 落地待裁项）。
+
+    背景（issue #63 台账「是否自动清理」）：`_git` 超时 kill 自己的 git 后，
+    影子仓可能留下 `index.lock`，此前只给人工核删指引。现**有界**自清：
+
+      ① **范围闸**：只碰本模块影子仓的 `<git_dir>/index.lock`——该仓由本模块
+         单属、轮级独占，无第三方 git 的合法持锁面。（**调用约定面**：影子仓
+         归属由调用方传入的 git_dir 保证；本函数机械面只保证对象名恒为
+         `<git_dir>/index.lock` 且须过②闸——独立复核 2026-10-06 观察 1 如实
+         标注。）
+      ② **时机/年龄闸**：`force=True` 仅在本模块**刚 kill 掉自己超时的 git
+         子进程**后调用（此刻仓内任何锁只可能来自该进程或其更早残留）；
+         非 force（每次 git 调用前的巡检）只在锁 **mtime 距今 ≥
+         `_GIT_LOCK_STALE_S`** 时清理（≫ 全部调用的 120s 超时上界，合法操作
+         结构性不可能持锁这么久）；
+      ③ **其余一律不删**（返回 "left"），异常消息保留人工核删指引。
+
+    返回 "cleared" / "left" / "absent"。
+    """
+    lock = os.path.join(git_dir_path, _GIT_LOCK_NAME)
+    try:
+        st = os.stat(lock)
+    except OSError:
+        return "absent"
+    age = max(0.0, time.time() - st.st_mtime)
+    if not force and age < _GIT_LOCK_STALE_S:
+        return "left"
+    try:
+        os.remove(lock)
+    except OSError:
+        return "left"
+    try:
+        _append_ledger({"event": "git_lock_cleared", "lock": lock,
+                        "age_s": round(age, 1), "force": bool(force)})
+    except OSError:               # 台账失败不阻断 git 主链（与审计面同风格）
+        pass
+    return "cleared"
+
+
 def _git(git_dir_path: str, work_tree: str, *args: str) -> subprocess.CompletedProcess:
     """git 调用的**唯一出口**：`--git-dir` 与 `--work-tree` 一律显式给。
 
     `--work-tree` 不是装饰：物化与合并传数据根，对账+提交传影子——同一个版本库
     两个工作树，靠这两个显式开关切换，**不依赖进程 cwd**（`hive/wm.py` 用 `-C`
     是因为它的工作树就是版本库本身；这里两者分居，故用分裂形态）。
+
+    **有界化（issue #63）**——四件套缺一不可：
+
+      ① `timeout=_GIT_TIMEOUT_S`：子进程**无界等待**是常驻循环停摆的直接成因
+         （实测停 9.5 小时：`SustainLoop` 单线程串行六档，任一档挂住即全停）。
+      ② `stdin=subprocess.DEVNULL`：不指定 stdin 时子进程**继承父进程 stdin**
+         ——DSH 常驻宿主的 stdin 是 **JSON-RPC 活管道**（不写入也不关闭），
+         任何读 stdin 的子进程会永久悬挂（实测：活管道下 6s 仍 poll=None；
+         DEVNULL 下 0.02s 立即 EOF）。先例形态：`md_cg/run_tests.py:105`。
+      ③ `TimeoutExpired` **不吞**：转 `SleepGitTimeout`（`SleepError` 子类，
+         既有 `except SleepError` 面照旧收得住），消息带命令名与残留锁处置读数。
+      ④ **残留锁有界自清**（2026-10-06 落地待裁项）：调用前置巡检清超龄残留
+         （崩溃场景），超时 kill 后 `force` 清当前残留（见 `_clear_git_lock`
+         三闸口径）——消息里如实带「已清理/未清理」。
     """
     argv = ["git", "--git-dir=" + git_dir_path, "--work-tree=" + work_tree]
     argv.extend(args)
     env = dict(os.environ, PYTHONUTF8="1")
-    return subprocess.run(argv, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace",
-                          env=env, shell=False)
+    # 前置巡检：清超龄残留锁（有界自清第一时机——崩溃残留，无 handler 可依）
+    _clear_git_lock(git_dir_path)
+    try:
+        return subprocess.run(argv, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              env=env, shell=False,
+                              timeout=_GIT_TIMEOUT_S,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as exc:
+        # 第二时机：本模块刚 kill 自己的 git——此刻仓内任何锁只可能是残留
+        _lock_state = _clear_git_lock(git_dir_path, force=True)
+        raise SleepGitTimeout(
+            "git %s 超时（%ss）已被 kill（命令：git %s）——"
+            "本次 git 操作未完成；残留锁处置：%s（%s）"
+            % (" ".join(args[:2]), _GIT_TIMEOUT_S, " ".join(args[:6]),
+               {"cleared": "已自动清理", "left": "未动，若后续报 lock 请人工核删",
+                "absent": "无残留锁"}.get(_lock_state, _lock_state),
+               os.path.join(git_dir_path, _GIT_LOCK_NAME))) from exc
 
 
-# 生效条件：同 _git 的调用形态；returncode != 0 时抛 SleepError（消息取 stderr 为真值、为空则取 stdout，strip 后截 300 字符），为 0 时返回 stdout。
+# 生效条件：同 _git 的调用形态；returncode != 0 时抛 SleepError（消息取 stderr 为真值、为空则取 stdout，strip 后截 300 字符），为 0 时返回 stdout；_git 侧超时以 SleepGitTimeout（SleepError 子类，消息含「超时…已被 kill」）原样冒出——两条失败面**可区分**（rc≠0 = git 的裁决；超时 = 操作没完成）。
 def _git_ok(git_dir_path: str, work_tree: str, *args: str) -> str:
     r = _git(git_dir_path, work_tree, *args)
     if r.returncode != 0:
@@ -326,10 +528,25 @@ def _has_head(git_dir_path: str, work_tree: str) -> bool:
 def _stage_and_commit(git_dir_path: str, work_tree: str, message: str) -> dict:
     """白名单 add + 有改动才 commit（Δ 为空 ⇒ 整轮跳过，§4.4）。"""
     ps = pathspecs(work_tree)
-    if not ps:
+    # issue #295③：**空层也要记删除**。pathspecs 只返回盘上非空的层，于是
+    # 「某层在盘上已空、索引/HEAD 里仍有文件」这件事入不了册：那些文件一直留在
+    # HEAD，下一轮影子 fork 出来又被判成「影子侧新增」重放回主库。旧版本里已经
+    # 混进别的根文件的 lib.git 被本根沿用（K3）时，也靠这一步在第一轮清掉。
+    # `git rm -r --cached` 只动索引，不碰工作树。
+    top = {p.split("/", 1)[0] for p in
+           _git_ok(git_dir_path, work_tree, "ls-files").splitlines() if p}
+    stale = [l for l in LAYERS if l not in ps and l in top]
+    if not ps and not stale:
         return {"committed": False, "reason": "白名单为空（真源面无任何 .md）",
                 "pathspecs": ps}
-    _git_ok(git_dir_path, work_tree, "add", "--", *ps)
+    # #405：add 走**只含 .md 的 glob**（add_pathspecs 单点）——层目录内的非 .md / 临时件
+    # 因此不再进不可逆历史；`ps`（层名）仍用于空集判据、stale 清索引与回执字段（既有裁定）。
+    aps = add_pathspecs(work_tree)
+    if aps:
+        _git_ok(git_dir_path, work_tree, "add", "--", *aps)
+    if stale:
+        _git_ok(git_dir_path, work_tree, "rm", "-r", "-q", "--cached", "--",
+                *stale)
     if _git(git_dir_path, work_tree, "diff", "--cached", "--quiet").returncode == 0:
         return {"committed": False, "reason": "Δ 为空（无待提交改动）",
                 "pathspecs": ps}
@@ -352,7 +569,7 @@ def _busy(phase: str, timeout: float) -> dict:
                        "只有一个能进）")}
 
 
-# 生效条件：root 为数据根（缺省取 mdcg_root()）；在 <state_root>/sleep/sleep 的根级锁内，建/复用独立 git 目录并（首次）把真源面入册为 main 基线，再 git worktree add -b sleep/<ts> <shadow> main（分支已存在则复用该分支重试一次）；返回含 ok/phase/busy/git_dir/shadow/branch/pathspecs/lock_acquired/source_face_delta/lock 的字典——ok 为真且 source_face_delta 三键全空 = 主库真源面逐字节未变。
+# 生效条件：root 为数据根（缺省取 mdcg_root()）；在 <state_root>/sleep/sleep 的根级锁内，建/复用独立 git 目录并（首次）把真源面入册为 main 基线，再 git worktree add -b sleep/<ts> <shadow> main（分支已存在则复用该分支重试一次）；返回含 ok/face_stable/phase/busy/lock_held/git_dir/shadow/branch/pathspecs/baseline/source_face_delta/lock 的字典——**ok = 物化动作是否成功**（正常挂上影子的成功路径恒真；取不到根级锁或影子未能挂上时保持假）；**face_stable = 主库真源面在物化窗口内逐字节未变**（原 ok 的真值；漂移不阻断物化，交 ③ 的并发闸按「主库优先」处置）。
 def materialize(root: str = None, *, git_dir_path: str = None,
                 shadow: str = None, ts: str = None,
                 timeout: float = DEFAULT_LOCK_TIMEOUT) -> dict:
@@ -360,42 +577,80 @@ def materialize(root: str = None, *, git_dir_path: str = None,
 
     幂等：影子已存在时先摘（`worktree remove --force`，非注册目录退化为 rmtree）
     再挂。分支已存在（同一秒重入）时退化为复用该分支。
+
+    `ok` 与 `face_stable` 是**两件事**（issue #60）：前者只说「影子挂上了没」，
+    后者才是「物化窗口内主库真源面有没有被别的写方动过」。窗口内漂移**不阻断**
+    迭代——活跃工作区（每轮都有新增 contextual/*.md）正是如此；同一 id 的改动
+    由 ③ 的并发闸（`baseline_face` 水位，主库优先）逐项裁决，那才是漂移的处置点。
     """
     root = os.path.abspath(root or mdcg_root())
-    G = git_dir_path or git_dir()
-    S = shadow or shadow_dir()
     branch = BRANCH_PREFIX + (ts or _stamp())
     before = source_face_hashes(root)
     with FileLock(lock_path(), timeout=timeout, strict=False) as lk:
         if not lk.acquired:
             return _busy("materialize", timeout)
-        rep = ensure_repo(root, G)
-        init = _stage_and_commit(G, root, "sleep: 基线（真源面入册）") \
-            if not _has_head(G, root) else {"committed": False,
-                                            "reason": "已有基线提交"}
-        if os.path.isdir(S):
-            r = _git(G, root, "worktree", "remove", "--force", S)
+        # issue #295①②：落点与绑定**必须在根级锁内解析**——两个根同时首轮时，
+        # 后到者只有看到先到者写下的绑定才能分到自己的槽；锁外解析会双双认领
+        # legacy lib.git，串库照旧。显式指定的 git_dir_path / shadow 仍优先，
+        # 但绑定检查对它们同样生效（覆盖显式把两根配到同一个 GITDIR 的情况）。
+        G = git_dir_path or git_dir(root=root)
+        S = shadow or shadow_dir(root=root)
+        err = _bind_error(G, root)
+        if err:
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "materialize", "lock": lock_path(),
+                    "git_dir": G, "shadow": S, "root": root, "error": err,
+                    "hint": "每个记忆根须用各自的 lib.git / 影子"}
+        try:
+            rep = ensure_repo(root, G)
+            _bind_root(G, root)
+            # #145①（2026-10-12 DSH 端）：**每轮都把真源面入册 lib.git**，不再只在首轮。
+            # 病象：修前 `if not _has_head(G, root)` ⇒ 首轮之后主库的编辑从不进版本库，
+            # 而影子是 `worktree add -b <branch> S BASE_BRANCH`（从**冻结基线** fork）
+            # ⇒ 影子拿到旧副本；本轮 merge 时旧副本被写回主库，**静默回滚**首轮之后的
+            # 编辑（实测：主库 v2 → 轮末回到 v1，且 ok=True、无冲突、无 deferred）。
+            # `_stage_and_commit` 自带「Δ 为空 ⇒ 零提交」幂等语义，故每轮调用安全。
+            init = _stage_and_commit(G, root, "sleep: 基线（真源面入册）")
+            # 基准提交＝本次入册后的 HEAD＝影子 fork 的起点（#145③ 写前复核用）
+            base_commit = _git_ok(G, root, "rev-parse", "HEAD").strip()
+            if os.path.isdir(S):
+                r = _git(G, root, "worktree", "remove", "--force", S)
+                if r.returncode != 0:
+                    # 非注册工作树（上一次运行被杀、目录残留）→ 直接摘目录
+                    shutil.rmtree(S, ignore_errors=True)
+            r = _git(G, root, "worktree", "add", "-b", branch, S, BASE_BRANCH)
             if r.returncode != 0:
-                # 非注册工作树（上一次运行被杀、目录残留）→ 直接摘目录
-                shutil.rmtree(S, ignore_errors=True)
-        r = _git(G, root, "worktree", "add", "-b", branch, S, BASE_BRANCH)
-        if r.returncode != 0:
-            r2 = _git(G, root, "worktree", "add", S, branch)
-            if r2.returncode != 0:
-                return {"ok": False, "busy": False, "lock_held": True,
-                        "phase": "materialize", "lock": lock_path(),
-                        "error": (r2.stderr or r2.stdout).strip()[:300],
-                        "hint": "影子分支/目录未能挂上"}
-            reused = True
-        else:
-            reused = False
+                r2 = _git(G, root, "worktree", "add", S, branch)
+                if r2.returncode != 0:
+                    return {"ok": False, "busy": False, "lock_held": True,
+                            "phase": "materialize", "lock": lock_path(),
+                            "error": (r2.stderr or r2.stdout).strip()[:300],
+                            "hint": "影子分支/目录未能挂上"}
+                reused = True
+            else:
+                reused = False
+        except SleepGitTimeout as e:
+            # 超时与「物化失败」分开记账（issue #63）：超时 = git 操作**没完成**
+            # （已被 kill），与 rc≠0 的「git 的裁决失败」不是一回事——
+            # run_cycle 据此写「物化超时：…」（见 mat_fail 分流）。
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "materialize", "lock": lock_path(),
+                    "timeout": True, "error": str(e),
+                    "hint": ("git 子进程超时已被 kill：本轮物化放弃；"
+                             "残留锁核删指引见 error")}
         after = source_face_hashes(root)
         delta = face_delta(before, after)
-        return {"ok": not (delta["added"] or delta["removed"] or delta["changed"]),
+        # ok = **物化动作成功**（影子已挂上）；真源面漂移与否是另一个读数
+        # （face_stable），不再拿来否决整轮迭代（issue #60）。
+        return {"ok": True,
+                "face_stable": not (delta["added"] or delta["removed"]
+                                    or delta["changed"]),
                 "busy": False, "lock_held": True, "phase": "materialize",
                 "git_dir": G, "shadow": S, "branch": branch,
                 "branch_reused": reused, "repo_created": rep["created"],
                 "baseline": init, "pathspecs": pathspecs(root),
+                # #145①：基准提交 + 基准水位（同一份读数，供 ③ 写前复核与三方比对）
+                "base_commit": base_commit, "base_face": after,
                 "lock": lock_path(), "source_face_delta": delta,
                 "source_face_count": len(after),
                 # §4.4 ① 的**基准水位**：物化这一刻的主库真源面内容哈希集合——
@@ -419,8 +674,15 @@ def reconcile_and_commit(root: str = None, *, git_dir_path: str = None,
     提交落到 `main` 而影子分支停在基线（见该函数说明的实测）。
     """
     root = os.path.abspath(root or mdcg_root())
-    G = git_dir_path or git_dir()
-    S = shadow or shadow_dir()
+    # #405 站点 3：**必须按 root 取库与影子**——原实现 `git_dir()` / `shadow_dir()` 不传 root，
+    # 于是即使调用方给了 root=B，落点仍是**默认根**的 lib.git/影子：返回 ok=True/committed=True，
+    # 提交信息却是 B 轮次，B 的改动根本没被提交（跨根错提交，不可逆）。
+    G = git_dir_path or git_dir(root=root)
+    S = shadow or shadow_dir(root=root)
+    _be = _bind_error(G, root)          # #295 同款绑定闸（同文件另外四入口均已接）
+    if _be:
+        return {"ok": False, "busy": False, "lock_held": False,
+                "phase": "reconcile_and_commit", "error": _be, "git_dir": G}
     before = source_face_hashes(root)
     with FileLock(lock_path(), timeout=timeout, strict=False) as lk:
         if not lk.acquired:
@@ -431,9 +693,17 @@ def reconcile_and_commit(root: str = None, *, git_dir_path: str = None,
                     "error": "影子工作树不存在：先 materialize", "shadow": S}
         # 链式工作树用自己的 gitdir（否则 HEAD/index 取主那一份，提交会落到 main）
         GS = worktree_git_dir(S) or G
-        br = branch or _git_ok(GS, S, "rev-parse", "--abbrev-ref", "HEAD").strip()
-        msg = "sleep: %s 轮对账提交" % (batch or _stamp())
-        res = _stage_and_commit(GS, S, msg)
+        try:
+            br = branch or _git_ok(GS, S, "rev-parse", "--abbrev-ref",
+                                   "HEAD").strip()
+            msg = "sleep: %s 轮对账提交" % (batch or _stamp())
+            res = _stage_and_commit(GS, S, msg)
+        except SleepGitTimeout as e:
+            # 超时（issue #63）：本阶段未完成——与「Δ 为空/未提交」等读数分开报。
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "reconcile_and_commit", "git_dir": G,
+                    "worktree_git_dir": GS, "shadow": S, "timeout": True,
+                    "error": str(e), "lock": lock_path()}
         after = source_face_hashes(root)
         delta = face_delta(before, after)
         return {"ok": not (delta["added"] or delta["removed"] or delta["changed"]),
@@ -460,33 +730,52 @@ def merge(root: str = None, *, git_dir_path: str = None, branch: str,
     ——不许在非主线上做合并（与 `wm.py:cmd_merge` 同判据）。
     """
     root = os.path.abspath(root or mdcg_root())
-    G = git_dir_path or git_dir()
-    S = shadow or shadow_dir()
+    G = git_dir_path or git_dir(root=root)
+    S = shadow or shadow_dir(root=root)
     before = source_face_hashes(root)
     with FileLock(lock_path(), timeout=timeout, strict=False) as lk:
         if not lk.acquired:
             return _busy("merge", timeout)
-        cur = _git_ok(G, root, "rev-parse", "--abbrev-ref", "HEAD").strip()
-        if cur != BASE_BRANCH:
-            return {"ok": False, "busy": False, "lock_held": True, "phase": "merge",
-                    "lock": lock_path(), "head": cur,
-                    "error": "当前 HEAD 在 %s，merge 须在 %s 上执行" % (cur, BASE_BRANCH)}
-        r = _git(G, root, "merge", "--no-ff", branch, "-m",
-                 "sleep: merge %s into %s" % (branch, BASE_BRANCH))
-        if r.returncode != 0:
-            out = (r.stdout + r.stderr).strip()
-            return {"ok": False, "busy": False, "lock_held": True, "phase": "merge",
-                    "lock": lock_path(), "shadow": S,
-                    "conflict": "CONFLICT" in out, "error": out[:500],
-                    "source_face_delta": face_delta(before, source_face_hashes(root)),
-                    "hint": ("冲突不自动解决（照 hive/wm.py 既有裁决）：人工/LLM 裁决后 "
-                             "git add + git commit 收口，或 git merge --abort 放弃本次合并")}
+        # issue #295：绑定到别的记忆根的 lib.git 一律拒绝（少做，不多写）。
+        _be = _bind_error(G, root)
+        if _be:
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "merge", "lock": lock_path(),
+                    "git_dir": G, "error": _be}
+        try:
+            cur = _git_ok(G, root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+            if cur != BASE_BRANCH:
+                return {"ok": False, "busy": False, "lock_held": True,
+                        "phase": "merge", "lock": lock_path(), "head": cur,
+                        "error": "当前 HEAD 在 %s，merge 须在 %s 上执行"
+                                 % (cur, BASE_BRANCH)}
+            r = _git(G, root, "merge", "--no-ff", branch, "-m",
+                     "sleep: merge %s into %s" % (branch, BASE_BRANCH))
+            if r.returncode != 0:
+                out = (r.stdout + r.stderr).strip()
+                return {"ok": False, "busy": False, "lock_held": True,
+                        "phase": "merge", "lock": lock_path(), "shadow": S,
+                        "conflict": "CONFLICT" in out, "error": out[:500],
+                        "source_face_delta": face_delta(before,
+                                                        source_face_hashes(root)),
+                        "hint": ("冲突不自动解决（照 hive/wm.py 既有裁决）："
+                                 "人工/LLM 裁决后 git add + git commit 收口，"
+                                 "或 git merge --abort 放弃本次合并")}
+            head = _git_ok(G, root, "rev-parse", "HEAD").strip()
+        except SleepGitTimeout as e:
+            # 超时（issue #63）：合并**未完成**（不是冲突、也不是被拒）——
+            # 单独一档读数，冲突裁决路径不受影响。
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "merge", "lock": lock_path(), "shadow": S,
+                    "timeout": True, "error": str(e),
+                    "hint": ("git 子进程超时已被 kill：合并未完成；"
+                             "残留锁核删指引见 error")}
         after = source_face_hashes(root)
         delta = face_delta(before, after)
         return {"ok": True, "busy": False, "lock_held": True, "phase": "merge",
-                "lock": lock_path(), "merged": branch,
-                "commit": _git_ok(G, root, "rev-parse", "HEAD").strip(),
-                "source_face_delta": delta, "main_written": delta["added"] + delta["changed"]}
+                "lock": lock_path(), "merged": branch, "commit": head,
+                "source_face_delta": delta,
+                "main_written": delta["added"] + delta["changed"]}
 
 
 # 生效条件：commit 为版本库中存在的提交（或分支名）；在根级锁内以其父提交数判是否 merge（git rev-list --parents -n1 字段数 > 2 即 merge），是 merge 则附 -m 1，执行 git revert --no-edit <参数> <commit>；returncode != 0 时返回 ok=False 与 conflict/error/hint，成功返回 ok=True、reverted、commit（新提交）与 source_face_delta。**只走 revert，不提供抹历史的强推档**。
@@ -501,27 +790,42 @@ def revert(commit: str, root: str = None, *, git_dir_path: str = None,
     与 `hive/wm.py:cmd_revert` 同口径。
     """
     root = os.path.abspath(root or mdcg_root())
-    G = git_dir_path or git_dir()
+    G = git_dir_path or git_dir(root=root)
     before = source_face_hashes(root)
     with FileLock(lock_path(), timeout=timeout, strict=False) as lk:
         if not lk.acquired:
             return _busy("revert", timeout)
-        parents = _git_ok(G, root, "rev-list", "--parents", "-n1", commit).split()
-        args = ["revert", "--no-edit"]
-        if len(parents) > 2:
-            args += ["-m", "1"]
-        args.append(commit)
-        r = _git(G, root, *args)
-        if r.returncode != 0:
-            out = (r.stdout + r.stderr).strip()
-            return {"ok": False, "busy": False, "lock_held": True, "phase": "revert",
-                    "lock": lock_path(), "conflict": "CONFLICT" in out,
-                    "error": out[:500],
-                    "hint": "冲突不自动解决；处理后可 git revert --continue / --abort"}
+        # issue #295：绑定到别的记忆根的 lib.git 一律拒绝。
+        _be = _bind_error(G, root)
+        if _be:
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "revert", "lock": lock_path(),
+                    "git_dir": G, "error": _be}
+        try:
+            parents = _git_ok(G, root, "rev-list", "--parents", "-n1",
+                              commit).split()
+            args = ["revert", "--no-edit"]
+            if len(parents) > 2:
+                args += ["-m", "1"]
+            args.append(commit)
+            r = _git(G, root, *args)
+            if r.returncode != 0:
+                out = (r.stdout + r.stderr).strip()
+                return {"ok": False, "busy": False, "lock_held": True,
+                        "phase": "revert", "lock": lock_path(),
+                        "conflict": "CONFLICT" in out, "error": out[:500],
+                        "hint": ("冲突不自动解决；处理后可 git revert --continue "
+                                 "/ --abort")}
+            head = _git_ok(G, root, "rev-parse", "HEAD").strip()
+        except SleepGitTimeout as e:
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "revert", "lock": lock_path(), "timeout": True,
+                    "error": str(e),
+                    "hint": ("git 子进程超时已被 kill：回滚未完成；"
+                             "残留锁核删指引见 error")}
         after = source_face_hashes(root)
         return {"ok": True, "busy": False, "lock_held": True, "phase": "revert",
-                "lock": lock_path(), "reverted": commit,
-                "commit": _git_ok(G, root, "rev-parse", "HEAD").strip(),
+                "lock": lock_path(), "reverted": commit, "commit": head,
                 "merge_commit": len(parents) > 2,
                 "source_face_delta": face_delta(before, after)}
 
@@ -532,7 +836,7 @@ def revert(commit: str, root: str = None, *, git_dir_path: str = None,
 def tracked_paths(root: str = None, *, git_dir_path: str = None) -> list:
     """版本库当前追踪的路径集合（`git ls-files`）。"""
     root = os.path.abspath(root or mdcg_root())
-    G = git_dir_path or git_dir()
+    G = git_dir_path or git_dir(root=root)
     return [ln.strip() for ln in _git_ok(G, root, "ls-files").splitlines()
             if ln.strip()]
 
@@ -541,20 +845,26 @@ def tracked_paths(root: str = None, *, git_dir_path: str = None) -> list:
 def history_paths(root: str = None, *, git_dir_path: str = None) -> list:
     """**全部历史**（所有分支、所有提交）里出现过的路径。"""
     root = os.path.abspath(root or mdcg_root())
-    G = git_dir_path or git_dir()
+    G = git_dir_path or git_dir(root=root)
     out = _git_ok(G, root, "log", "--all", "--name-only", "--pretty=format:")
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
 
-# 生效条件：对 history_paths 去重后逐个取 basename；basename 属于 FORBIDDEN_BASENAMES 或以 FORBIDDEN_SUFFIXES 之一结尾者计入命中；返回按路径排序的命中表（零命中 = 合规）。
+# 生效条件：对 history_paths 去重后逐个取 basename；basename 属于 FORBIDDEN_BASENAMES、或以 FORBIDDEN_SUFFIXES 之一结尾、或含 FORBIDDEN_INFIXES 之一者计入命中；返回按路径排序的命中表（零命中 = 合规）。
 def history_forbidden_hits(root: str = None, *,
                            git_dir_path: str = None) -> list:
     """历史里的禁入路径（§4.5：`_keys.json` / `_access.log` / `_index.json` /
-    `*.tmp` / `*.lock` **零命中**）。"""
+    `*.tmp` / `*.lock` **零命中**）。
+
+    #405：判据形态必须**覆盖真实命名**——原子写临时件是 `.<name>.md.tmp-<rand>`
+    （中缀），原 `endswith` 判据对它零命中；补 `FORBIDDEN_INFIXES` 后同一份历史里
+    这类件会被如实命中（与「判据与自述对象一致」同一纪律）。
+    """
     hits = []
     for p in sorted(set(history_paths(root, git_dir_path=git_dir_path))):
         base = p.rsplit("/", 1)[-1]
-        if base in FORBIDDEN_BASENAMES or base.endswith(FORBIDDEN_SUFFIXES):
+        if (base in FORBIDDEN_BASENAMES or base.endswith(FORBIDDEN_SUFFIXES)
+                or any(x in base for x in FORBIDDEN_INFIXES)):
             hits.append(p)
     return hits
 
@@ -653,6 +963,34 @@ def batch_merged(batch: str) -> bool:
         return False
     return any(r.get("batch") == batch and r.get("merged") is True
                for r in read_ledger())
+
+
+# 生效条件：无入参；返回台账里的**下一轮序号**（已有记录中最大的 round + 1；空台账/无有效 round 时为 1）——CLI `--once` 接着历史轮次编号，不另起一套计数。
+def next_round_index() -> int:
+    nums = [r.get("round") for r in read_ledger()]
+    nums = [n for n in nums if isinstance(n, int) and not isinstance(n, bool)]
+    return (max(nums) + 1) if nums else 1
+
+
+# 生效条件：rec 为 run_cycle 落台账的记录字典时，返回 ⑦记录步里的 phases 字典（缺该步或形态不符时返回 {}）。
+def _record_phases(rec: dict) -> dict:
+    for s in (rec.get("steps") or []):
+        if isinstance(s, dict) and s.get("step") == "record":
+            return s.get("phases") or {}
+    return {}
+
+
+# 生效条件：rec 为 run_cycle 落台账的记录字典时返回「本轮未迭代原因」文案或 None——先取门拦 `rec["skipped"]`，再取 ②③④ 的 skip 文案（物化未完成等）；已迭代的一轮返回 None。CLI `--once` 与 `--status` 的同一文案源（不另写第二份判据）。
+def cycle_not_iterated_reason(rec: dict):
+    if not isinstance(rec, dict):
+        return None
+    if rec.get("skipped"):
+        return rec["skipped"]
+    for s in (rec.get("steps") or []):
+        if isinstance(s, dict) and s.get("step") in ("induce", "promote", "scrub") \
+                and s.get("skipped"):
+            return s["skipped"]
+    return None
 
 
 # 生效条件：root 给定且 md_cg.mdcos 可导入时返回该 root 上的 MdCGOS 实例；导入失败抛原异常。
@@ -879,6 +1217,15 @@ def gate_delta(cg_main, delta: dict, *, baseline_face: dict = None,
                                   "reason": ("主库在迭代期间改动过同一 id（或新增同名 id）"
                                              "——主库优先，本项挂起不自动解决")})
                 continue
+            # #145②（2026-10-12 DSH 端）· **三方比对（base / 影子 / 当前 main）**的落点说明：
+            # 修前本闸只比「base vs 当前 main」两方。我最初在此处按**内容哈希**补第三
+            # 方（影子文件 != base ⇒ 挂起），沙箱实测**误伤合法影子编辑**：影子迭代本来
+            # 就以「影子内容 ≠ base」为常态（实测 accepted 由 [a] 变 []，a 的影子版被挂起），
+            # 故**已回退**该形态。正解是比**影子分支的 fork 点**而不是内容：旧副本的成因
+            # 是「影子 fork 自更早的提交」，其 fork 点必然落后于基准提交——该判据落在
+            # `merge_cycle` 的写前复核（#145③：`merge-base HEAD <branch>` 必须等于当前
+            # HEAD，即等于 materialize 入册后的基准提交），既不误伤影子编辑、又掐住旧
+            # 副本进入重放的入口。此处保持两方读数不变（零回归）。
         # ④ 生命周期闸：非法迁移不得由睡眠周期写进主库。
         src = d.get("before_lifecycle") or "active"
         dst = d.get("after_lifecycle") or "active"
@@ -923,8 +1270,8 @@ def reconcile_gated(root: str = None, *, git_dir_path: str = None,
                     timeout: float = DEFAULT_LOCK_TIMEOUT) -> dict:
     """③ 对账 + 提交（§4.4，**持根级锁**）：Δ 逐项过四闸 → 只把通过者入册。"""
     root = os.path.abspath(root or mdcg_root())
-    G = git_dir_path or git_dir()
-    S = shadow or shadow_dir()
+    G = git_dir_path or git_dir(root=root)
+    S = shadow or shadow_dir(root=root)
     before = source_face_hashes(root)
     with FileLock(lock_path(), timeout=timeout, strict=False) as lk:
         if not lk.acquired:
@@ -938,10 +1285,20 @@ def reconcile_gated(root: str = None, *, git_dir_path: str = None,
         gated = gate_delta(cgm, delta, baseline_face=baseline_face,
                            shadow_root=S)
         GS = worktree_git_dir(S) or G
-        br = branch or _git_ok(GS, S, "rev-parse", "--abbrev-ref", "HEAD").strip()
-        rels = _stage_set(delta, gated["accepted"])
-        res = _commit_paths(GS, S, rels,
-                            "sleep: %s 轮对账提交" % (batch or _stamp()))
+        try:
+            br = branch or _git_ok(GS, S, "rev-parse", "--abbrev-ref",
+                                   "HEAD").strip()
+            rels = _stage_set(delta, gated["accepted"])
+            res = _commit_paths(GS, S, rels,
+                                "sleep: %s 轮对账提交" % (batch or _stamp()))
+        except SleepGitTimeout as e:
+            # 超时（issue #63）：四闸裁决读数（delta / accepted / conflicts /
+            # rejected）照带——只是入册没完成。
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "reconcile_gated", "git_dir": G,
+                    "worktree_git_dir": GS, "shadow": S, "timeout": True,
+                    "error": str(e), "lock": lock_path(),
+                    "delta": delta, **gated}
         after = source_face_hashes(root)
         return {"ok": True, "busy": False, "lock_held": True,
                 "phase": "reconcile_gated", "git_dir": G, "worktree_git_dir": GS,
@@ -1012,17 +1369,47 @@ def merge_cycle(cg_main, root: str = None, *, git_dir_path: str = None,
                 timeout: float = DEFAULT_LOCK_TIMEOUT) -> dict:
     """④ 合并（§4.4，**持根级锁**）：语义重放 → `--no-ff` 合并；冲突挂起。"""
     root = os.path.abspath(root or cg_main.root)
-    G = git_dir_path or git_dir()
-    S = shadow or shadow_dir()
+    G = git_dir_path or git_dir(root=root)
+    S = shadow or shadow_dir(root=root)
     before = source_face_hashes(root)
     with FileLock(lock_path(), timeout=timeout, strict=False) as lk:
         if not lk.acquired:
             return _busy("merge_cycle", timeout)
-        cur = _git_ok(G, root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        # issue #295：绑定到别的记忆根的 lib.git 一律拒绝。
+        _be = _bind_error(G, root)
+        if _be:
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "merge_cycle", "lock": lock_path(),
+                    "git_dir": G, "error": _be}
+        try:
+            cur = _git_ok(G, root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        except SleepGitTimeout as e:
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "merge_cycle", "lock": lock_path(),
+                    "branch": branch, "timeout": True, "error": str(e),
+                    "hint": ("git 子进程超时已被 kill：合并尚未开始；"
+                             "残留锁核删指引见 error")}
         if cur != BASE_BRANCH:
             return {"ok": False, "busy": False, "lock_held": True,
                     "phase": "merge_cycle", "lock": lock_path(), "head": cur,
                     "error": "当前 HEAD 在 %s，merge 须在 %s 上执行" % (cur, BASE_BRANCH)}
+        # #145③（2026-10-12 DSH 端）：**写前复核**——影子必须 fork 自**当前 HEAD**。
+        # 影子陈旧（fork 点落后于 HEAD，例如两次物化之间主库被别的写方推进过）时
+        # 直接拒绝重放（保守路径），不让旧副本有写回主库的机会。
+        try:
+            _head = _git_ok(G, root, "rev-parse", "HEAD").strip()
+            _mb = _git_ok(G, root, "merge-base", "HEAD", branch).strip()
+        except Exception as _e:                                # noqa: BLE001
+            _head = _mb = ""
+        if _head and _mb and _mb != _head:
+            return {"ok": False, "busy": False, "lock_held": True,
+                    "phase": "merge_cycle", "lock": lock_path(), "branch": branch,
+                    "aborted": "stale_shadow", "head": _head[:12],
+                    "merge_base": _mb[:12],
+                    "error": "影子 fork 点 %s 落后于当前 HEAD %s ⇒ 影子是陈旧副本"
+                    % (_mb[:8], _head[:8]),
+                    "hint": ("#145③ 写前复核拒绝重放：请重新 materialize（会把主库真源面"
+                             "入册并据此重挂影子）后再合并")}
         rep = (replay_to_main(cg_main, S, delta or {}, accepted or [],
                               batch=batch) if replay
                else {"written": [], "skipped": [], "failed": [], "entries": []})
@@ -1036,39 +1423,54 @@ def merge_cycle(cg_main, root: str = None, *, git_dir_path: str = None,
         # 层迁移会把源层目录搬空，`pathspecs` 滤空目录后就把「旧位置删除」漏掉，
         # 主库 HEAD 会留着旧文件 ⇒ 与影子分支的树不同（本机实测过这个漏）。
         ps = _stage_set(delta or {}, accepted or [])
-        if ps:
-            _git_ok(G, root, "add", "--", *ps)
-            if _git(G, root, "diff", "--cached", "--quiet").returncode != 0:
-                _git_ok(G, root, "commit", "-m",
-                        "sleep: %s 语义重放 Δ" % (batch or _stamp()))
-                # **本轮内容所在的提交**（回退入口）：按 §4.4 的次序，内容由
-                # 「语义重放」先写进主库并提交，随后的 `--no-ff` 合并只是**拓扑记录**
-                # （其树与第一父提交相同 ⇒ `git revert -m 1 <合并提交>` 对内容零影响，
-                # 回退要指向本提交；ops 文档据此登记）。
-                out["round_commit"] = _git_ok(G, root, "rev-parse", "HEAD").strip()
-        out["replay_commit"] = _git_ok(G, root, "rev-parse", "HEAD").strip()
-        # 仅当两侧树**完全相同**才合并（否则让 git 的文本自动合并去裁决就会绕过四闸）
-        same = _git(G, root, "diff", "--quiet", branch, "HEAD").returncode == 0
-        if not same:
-            changed = [ln.strip() for ln in _git(
-                G, root, "diff", "--name-only", branch, "HEAD").stdout.splitlines()
-                if ln.strip()]
-            out.update(deferred="tree_divergence",
-                       note="影子分支与重放后的主库树不同 ⇒ 挂起不合并（不自动解决）",
-                       conflict_ids=sorted({os.path.basename(p)[:-3]
-                                            for p in changed}))
+        try:
+            if ps:
+                _git_ok(G, root, "add", "--", *ps)
+                if _git(G, root, "diff", "--cached", "--quiet").returncode != 0:
+                    _git_ok(G, root, "commit", "-m",
+                            "sleep: %s 语义重放 Δ" % (batch or _stamp()))
+                    # **本轮内容所在的提交**（回退入口）：按 §4.4 的次序，内容由
+                    # 「语义重放」先写进主库并提交，随后的 `--no-ff` 合并只是**拓扑记录**
+                    # （其树与第一父提交相同 ⇒ `git revert -m 1 <合并提交>` 对内容零影响，
+                    # 回退要指向本提交；ops 文档据此登记）。
+                    out["round_commit"] = _git_ok(G, root, "rev-parse",
+                                                  "HEAD").strip()
+            out["replay_commit"] = _git_ok(G, root, "rev-parse", "HEAD").strip()
+            # 仅当两侧树**完全相同**才合并（否则让 git 的文本自动合并去裁决就会绕过四闸）
+            same = _git(G, root, "diff", "--quiet", branch,
+                        "HEAD").returncode == 0
+            if not same:
+                changed = [ln.strip() for ln in _git(
+                    G, root, "diff", "--name-only", branch,
+                    "HEAD").stdout.splitlines() if ln.strip()]
+                out.update(deferred="tree_divergence",
+                           note=("影子分支与重放后的主库树不同 ⇒ 挂起不合并"
+                                 "（不自动解决）"),
+                           conflict_ids=sorted({os.path.basename(p)[:-3]
+                                                for p in changed}))
+                out["source_face_delta"] = face_delta(before,
+                                                      source_face_hashes(root))
+                return out
+            r = _git(G, root, "merge", "--no-ff", branch, "-m",
+                     "sleep: merge %s into %s" % (branch, BASE_BRANCH))
+            if r.returncode != 0:
+                txt = (r.stdout + r.stderr).strip()
+                out.update(ok=False, conflict="CONFLICT" in txt, error=txt[:500],
+                           hint=("冲突不自动解决（照 hive/wm.py 既有裁决）："
+                                 "人工裁决后 git add + git commit 收口，"
+                                 "或放弃本次合并"))
+                out["source_face_delta"] = face_delta(before,
+                                                      source_face_hashes(root))
+                return out
+            out["merge_commit"] = _git_ok(G, root, "rev-parse", "HEAD").strip()
+        except SleepGitTimeout as e:
+            # 超时（issue #63）：重放后的入册/合并**未完成**（既非冲突、也非
+            # 树分歧）——单独一档读数，与上面两条裁决路径分开。
+            out.update(ok=False, timeout=True, error=str(e),
+                       hint=("git 子进程超时已被 kill：入册/合并未完成；"
+                             "残留锁核删指引见 error"))
             out["source_face_delta"] = face_delta(before, source_face_hashes(root))
             return out
-        r = _git(G, root, "merge", "--no-ff", branch, "-m",
-                 "sleep: merge %s into %s" % (branch, BASE_BRANCH))
-        if r.returncode != 0:
-            txt = (r.stdout + r.stderr).strip()
-            out.update(ok=False, conflict="CONFLICT" in txt, error=txt[:500],
-                       hint=("冲突不自动解决（照 hive/wm.py 既有裁决）：人工裁决后 "
-                             "git add + git commit 收口，或放弃本次合并"))
-            out["source_face_delta"] = face_delta(before, source_face_hashes(root))
-            return out
-        out["merge_commit"] = _git_ok(G, root, "rev-parse", "HEAD").strip()
         out["merged"] = branch
         after = source_face_hashes(root)
         dlt = face_delta(before, after)
@@ -1151,13 +1553,19 @@ def ledger_steps(*, scan: dict, iterated: dict = None, delta_digest: dict = None
     return steps
 
 
-# 生效条件：给定 cg（主库）与各相位开关时，按 §3.2 的稳态判据与 §4.4 的四阶段跑一轮睡眠周期并返回台账记录；enabled=False / merge_mode="never" / 窗口外 / 候选数为 0 四种情形**只记账不动手**（②③④记 skipped）；batch 为已合并批次时直接返回 {"idempotent": True} 且零动作。
+# 生效条件：给定 cg（主库）与各相位开关时，按 §3.2 的稳态判据与 §4.4 的四阶段跑一轮睡眠周期并返回台账记录；enabled=False / merge_mode="never" / 窗口外 / 候选数为 0 四种情形**只记账不动手**（②③④记 gate_reason）；物化未完成（busy/error）时 ②③④ 记「物化未完成：…」（与门拦文案**区分**）；batch 为已合并批次时直接返回 {"idempotent": True} 且零动作；dry_run=True 时只跑感知盘点与四道门评估（**不物化、不记账**）。
 def run_cycle(cg=None, *, root: str = None, batch: str = None,
               enabled: bool = True, merge_mode: str = None,
               scrub_apply: bool = None, window: str = None,
               round_index: int = 1, now=None, git_dir_path: str = None,
-              shadow: str = None, timeout: float = DEFAULT_LOCK_TIMEOUT) -> dict:
-    """一轮睡眠周期（§3.1 九步 + §4.4 四阶段）。"""
+              shadow: str = None, dry_run: bool = False,
+              timeout: float = DEFAULT_LOCK_TIMEOUT) -> dict:
+    """一轮睡眠周期（§3.1 九步 + §4.4 四阶段）。
+
+    `dry_run=True` 是**预览档**（`--once --dry-run`）：只跑 ① 感知盘点与四道门
+    评估（总开关 / 合并策略 / 窗口 / 稳态），**不物化、不记账**——早退点刻意
+    置于 `materialize` 之前，也不触 `_append_ledger`。
+    """
     root = os.path.abspath(root or (cg.root if cg is not None else mdcg_root()))
     if cg is None:
         cg = _open_cg(root)
@@ -1179,7 +1587,10 @@ def run_cycle(cg=None, *, root: str = None, batch: str = None,
                    candidates=None, steps=ledger_steps(
                        scan={}, skip_reason="幂等：同批次已合并",
                        round_index=round_index, prev_candidates=prev))
-        _append_ledger(rec)
+        if dry_run:
+            rec["dry_run"] = True               # 预览档：**不记账**
+        else:
+            _append_ledger(rec)
         return rec
 
     # ① 感知盘点（主库，只读）——稳态判据的口径
@@ -1200,14 +1611,42 @@ def run_cycle(cg=None, *, root: str = None, batch: str = None,
     elif not scan["candidates"]:
         gate_reason = "稳态：盘点候选数为 0（只记账不动手）"
 
+    if dry_run:
+        # 预览档：四道门已评完即止——**不物化、不记账**（连影子都不建）。
+        rec.update(dry_run=True, skipped=gate_reason,
+                   planned=(None if gate_reason
+                            else "将执行物化→迭代→对账→合并"),
+                   steps=ledger_steps(scan=scan, round_index=round_index,
+                                      prev_candidates=prev,
+                                      skip_reason=gate_reason or ""))
+        return rec
+
     phases, iterated, delta, digest = {}, None, {}, {"n": 0, "ids": [], "kinds": {}}
+    mat_fail = None
     if gate_reason is None:
         m = materialize(root, git_dir_path=git_dir_path, shadow=shadow,
                         ts=b, timeout=timeout)
         phases["materialize"] = {k: m.get(k) for k in
-                                 ("ok", "busy", "branch", "shadow", "git_dir",
-                                  "baseline", "source_face_delta")}
+                                 ("ok", "face_stable", "busy", "branch", "shadow",
+                                  "git_dir", "baseline", "source_face_delta",
+                                  "reason", "error", "timeout")}
+        if not m.get("ok"):
+            # 物化**未完成**（取不到根级锁 / 影子未能挂上 / git 超时）——与
+            # 「门拦」区分记账：门拦是「按设计不动手」，这里是「想动手却没做成」，
+            # 用户要能一眼分开；超时再单列一档文案（issue #63：物化超时 ≠
+            # 物化失败——前者是操作没完成、后者是 git 的裁决）。
+            mat_fail = ("物化未完成：根级锁被占（另一进程在周期内）"
+                        if m.get("busy")
+                        else ("物化超时：%s" % (m.get("error") or "未知原因")
+                              if m.get("timeout")
+                              else "物化未完成：%s" % (m.get("error")
+                                                       or "未知原因")))
         if m.get("ok"):
+            # **物化成功即迭代**（issue #60）：`ok` 现在只说「影子挂上了没」；
+            # 物化窗口内主库真源面的漂移另记 `face_stable`，**不阻断**迭代——
+            # 活跃工作区（每轮都有新写入）本就如此。迭代期间主库被改动/新增的
+            # 同一 id，由下面对账段的并发闸（`baseline_face` 水位）逐项裁
+            # 「主库优先」——那才是漂移的处置点，不是在这里自我否决。
             S = m["shadow"]
             iterated = iterate(S, scrub_apply=scrub)
             phases["iterate"] = iterated
@@ -1217,7 +1656,7 @@ def run_cycle(cg=None, *, root: str = None, batch: str = None,
                                  cg=cg, timeout=timeout)
             phases["reconcile"] = {k: rc.get(k) for k in
                                    ("committed", "commit", "branch", "reason",
-                                    "busy")}
+                                    "busy", "timeout", "error")}
             delta = rc.get("delta") or {}
             digest = {"n": len(delta), "ids": sorted(delta)[:20],
                       "kinds": {k: sum(1 for v in delta.values() if v["kind"] == k)
@@ -1238,7 +1677,8 @@ def run_cycle(cg=None, *, root: str = None, batch: str = None,
                                        ("ok", "merged", "merge_commit",
                                         "round_commit", "replay_commit",
                                         "deferred", "conflict", "conflict_ids",
-                                        "error", "main_written", "busy")}
+                                        "error", "main_written", "busy",
+                                        "timeout")}
                     phases["merge"]["replayed"] = (mg.get("replayed") or {}).get("written")
                     rec["merged"] = bool(mg.get("ok")) and not mg.get("deferred")
                     if mg.get("deferred"):
@@ -1255,25 +1695,64 @@ def run_cycle(cg=None, *, root: str = None, batch: str = None,
     rec["steps"] = ledger_steps(scan=scan, iterated=iterated,
                                 delta_digest=digest, phases=phases,
                                 round_index=round_index, prev_candidates=prev,
-                                skip_reason=gate_reason or "")
+                                skip_reason=gate_reason or mat_fail or "")
     rec["skipped"] = gate_reason
     _append_ledger(rec)
     return rec
 
 
-# 生效条件：argv 含 --status 时打印当前解析结果（git_dir / shadow / lock / pathspecs / tracking / history 四读数）的 JSON 并返回 0；argv 含 --audit 时只打印两条机械判据结论（不合规返回 1）；无参数时打印解析结果。
+# 生效条件：recs 为 read_ledger(limit=1) 的返回（空列表或单条记录）时，返回该记录的 CLI 视图（t/batch/round/candidates/skipped / ②③④ skip 文案 / phases.materialize 摘要 / 未迭代原因）；无记录返回 None。
+def _last_cycle_view(recs):
+    if not recs:
+        return None
+    rec = recs[-1]
+    return {"t": rec.get("t"), "batch": rec.get("batch"),
+            "round": rec.get("round"), "candidates": rec.get("candidates"),
+            "skipped": rec.get("skipped"),
+            "steps_skip": {s.get("step"): s.get("skipped")
+                           for s in (rec.get("steps") or [])
+                           if isinstance(s, dict)
+                           and s.get("step") in ("induce", "promote", "scrub")},
+            "materialize": _record_phases(rec).get("materialize"),
+            "not_iterated_reason": cycle_not_iterated_reason(rec)}
+
+
+# 生效条件：argv 含 --once 时以 env 读取器为参数跑一轮 run_cycle（round 取 next_round_index()；--dry-run 同用时只预览、不物化不记账）并打印整条记录与「本轮未迭代原因」（未迭代时，文案与台账同源）；argv 含 --audit 时只打印两条机械判据结论（不合规返回 1）；--dry-run **不与 --once 同用**时返回 2（报错，不执行任何动作）；其余情形打印当前解析结果（git_dir / shadow / lock / pathspecs / tracking / history / **last_cycle** 读数）的 JSON 并返回 0。
 def _main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="睡眠周期 git 机制（只读判读面）")
+    ap = argparse.ArgumentParser(description="睡眠周期 git 机制（只读判读 + 手动一轮）")
     ap.add_argument("--root", default=None, help="数据根（缺省 mdcg_root()）")
     ap.add_argument("--git-dir", dest="git_dir_path", default=None)
     ap.add_argument("--shadow", default=None)
     ap.add_argument("--status", action="store_true", help="打印当前解析与判据读数")
     ap.add_argument("--audit", action="store_true", help="只跑两条机械判据")
+    ap.add_argument("--once", action="store_true",
+                    help="立即跑一轮睡眠周期（不等常驻循环的 tick；同样过四道门）")
+    ap.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="只预览（须与 --once 同用）：跑盘点与四道门，不物化、不记账")
     a = ap.parse_args(argv)
+    if a.dry_run and not a.once:
+        sys.stderr.write("--dry-run 须与 --once 同用："
+                         "单独使用不执行任何动作（预览一轮请用 --once --dry-run）\n")
+        return 2
     root = os.path.abspath(a.root or mdcg_root())
-    G = a.git_dir_path or git_dir()
-    shadow = a.shadow or shadow_dir()
+    G = a.git_dir_path or git_dir(root=root)
+    shadow = a.shadow or shadow_dir(root=root)
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if a.once:
+        rec = run_cycle(None, root=root, enabled=sleep_enabled(),
+                        merge_mode=sleep_merge_mode(),
+                        scrub_apply=sleep_scrub_apply(), window=sleep_window(),
+                        round_index=next_round_index(), dry_run=a.dry_run,
+                        git_dir_path=a.git_dir_path, shadow=a.shadow)
+        print(json.dumps(rec, ensure_ascii=False, indent=2))
+        if rec.get("dry_run"):
+            print("预览：" + (rec.get("planned")
+                            or ("门拦：%s" % (rec.get("skipped") or ""))))
+        else:
+            why = cycle_not_iterated_reason(rec)
+            if why:
+                print("本轮未迭代原因：" + why)
+        return 0
     if a.audit:
         tr = audit_tracking(root, git_dir_path=G)
         hi = audit_history(root, git_dir_path=G)
@@ -1289,6 +1768,8 @@ def _main(argv=None) -> int:
     if os.path.isdir(G):
         out["tracking"] = audit_tracking(root, git_dir_path=G)
         out["history"] = audit_history(root, git_dir_path=G)
+    # 上一轮读数：从 CLI 就能看到「上次为何没迭代」（门拦 / 物化未完成 / 幂等）。
+    out["last_cycle"] = _last_cycle_view(read_ledger(limit=1))
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 

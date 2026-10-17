@@ -46,6 +46,9 @@ _DELIM = "---"
 # 完整的 6 行 MARKS：功能名（标题）+ 5 要素（条件、子功能、执行、验证、不适用）。
 # 「验证方式」与「不适用条件」是白箱的关键新增，缺则不可证 ACCEPT/REJECT。
 CCG_MARKS = ("功能名", "生效条件", "子功能", "执行", "验证方式", "不适用条件")
+# 有界的六字段正则表；避免每个标题探测都重建并 escape 同一模式。
+_CCG_HEADING_PATTERNS = {mark: re.compile(r"^#\s*" + re.escape(mark))
+                         for mark in CCG_MARKS}
 # 门槛即全部 MARKS：原先「生效条件可隐含」的豁免已废止（观测位置 ≠ 生效条件，
 # 见 `condition_space_text`）——生效条件必须由 condition_space 四槽合成显式声明，
 # 不存在「常用条件默认省略」的合法情形。缺它即缺证据：补写，或判 BLINDSPOT。
@@ -84,6 +87,28 @@ CCG_CONTRACT_ROLES = {
     "不适用条件": "拒绝域 rejection_domain",
 }
 
+# ---- issue #218（2026-10-13 DSH 端）：**「验证方式」召回面的真实语义登记** ----
+# 上表给「验证方式」的契约角色是「后置条件 postcondition + test」。本注释登记它
+# 在**召回面**上的实际出口（判据真源 = mdcg.index_key_hits，此处不复制判据，
+# 只登记语义；两处若不一致以 index_key_hits 为准）：
+#
+#   ① term     —— **值敏感**：查询侧展开出的词项（expand_query_terms）与
+#                  「# 验证方式：行切分后的词项」有子串相交即命中。
+#                  可达性取决于**查询**是否含该值，而非值的质量。
+#   ② declared —— **值盲**：is_postcondition_query(查询) 为真且该行切分后
+#                  非空即命中——**任意非空取值（切分后词长 >= ELEMENT_TERM_MIN）**
+#                  产生同一输出。此为**刻意设计**（「声明了验证方式即召回」，与
+#                  rejection_terms 的边界问句同构），不是缺陷。
+#
+# 两条出口经 index_key_hits 的 post_source 字段区分（issue #218 新增）：
+# "term" = 值命中；"declared" = 值未参与判定。
+#
+# **值域控制已有真源，勿另造词表**：VERIFICATION_BASIS（本模块 :121）就是
+# 「验证方式」取值该落的受控词集（compiler/test/measurement/formal_proof/data/
+# textbook/public_kb/other），且已绑定 frontmatter.verification_basis 的写入校验。
+# issue #218 建议的选项 (c)「对取值设词表校验」**不需要新造词表**——需要裁定的是
+# 「召回面是否应据此收紧」，属设计裁定（见该 issue 回复）。
+
 # ---- 裁定 C（Phase 0 契约裁决 · 2026-09-17）：索引元条件与功能生效条件字段分家 ----
 # 病根：codeindex.render 曾把**机械推导的索引元条件**（本地源码仓 / 全时窗 /
 # AST 工具 / 文件可读）写成「生效条件」行，与「功能生效条件」（人工声明：
@@ -116,12 +141,39 @@ def is_ccg_mark(name: str) -> bool:
 #   · 来源一致性档（文科）：textbook（人教版教材表述一致）/ public_kb（公开知识库一致）
 #     —— 文科知识不是可复现的物理事实，以「权威来源表述一致」为足够基底
 VERIFICATION_BASIS = ("compiler", "test", "measurement", "formal_proof", "data",
-                      "textbook", "public_kb", "other")
+                      "textbook", "public_kb", "other",
+                      # issue #466：外部 ingest 的内容基底。
+                      #   · 在**可接受集**（本词表）内，**不在** forgetting.VERIFIED_BASES
+                      #     （已验集）——「不在前者」与「不在后者」是两件事；判据函数是
+                      #     verification_basis_valid（可接受），不是 is_verified。
+                      #   · 与 trust 的**验证态列**（unverified/verified/…）**不是同一面**：
+                      #     那一列描述「这条记忆被验到什么程度」，本词表描述「断言凭什么成立」。
+                      #   · 沿用 :107 口径「值域控制已有真源，勿另造词表」⇒ 本件是**扩既有词表**。
+                      #   · 子档归属：**在两档外**（REPRODUCIBLE_BASIS / CONSISTENCY_BASIS）——
+                      #     外部内容既非可复现、亦非来源一致，归任何一档都是错的。
+                      #     守卫 md_cg/test_issue466_basis_registry.py 的 A 组钉住这三点。
+                      "untrusted")
 
 #: 可复现档：理科断言必须落在这一档（复现证据）
 REPRODUCIBLE_BASIS = ("compiler", "test", "measurement", "formal_proof", "data")
 #: 来源一致性档：文科断言可用（来源表述一致即可）
 CONSISTENCY_BASIS = ("textbook", "public_kb")
+
+# ---- 多主体世界模型对齐（2026-10-05）：检验强度字段真源 ----------------------------
+# 「检验强度」分级（过程追踪过程 tracing 方法，见对齐评估 v0.1 §2 L1）：一条断言
+# 的**证据能带走多少裁决权重**——hoop（必要证据：不满足即证伪）/ smoking_gun
+# （决定性：单独即可确立）/ doubly_decisive（同时排除竞争假设）。与
+# `verification_basis`（来源**类型**）正交：一个说「凭什么类别的证据」，一个说
+# 「证据的裁决力有多强」。缺省 None＝未声明（**不落 fm 键**，存量零迁移、读取侧
+# `.get()` 回落）；显式传入时校验闭集（与 VERIFICATION_BASIS 同风格）。
+CHECK_STRENGTHS = ("hoop", "smoking_gun", "doubly_decisive")
+CHECK_STRENGTH_FIELD = "check_strength"
+
+#: 幽灵引用标记字段（A2，多主体世界模型对齐 v0.1 §2 L1「转引不得升级」）：
+#: 写入链检测到的**无可解析出处**的回指短语清单（短语层），落 fm 供后续
+#: 裁决/检索看见。**正文属性**：每次写入按当次检测重算、不继承（与
+#: check_strength 的声明继承语义相反——正文变了检测就该变）。
+UNCERTAIN_REFS_FIELD = "uncertain_refs"
 
 # ---- 裁定 D（2026-09-19）：可验证记忆单元的**字段名真源** --------------------------
 # 「子功能」的契约角色是**依赖 dependency**（见 CCG_CONTRACT_ROLES），其落字段即
@@ -337,6 +389,111 @@ def loads(text: str):
     return fm, content
 
 
+# 生效条件：x 为任意值时，x is None（未声明）或 isinstance(x, str) 返回 True，否则 False；无副作用、不抛异常。
+def valid_role(x) -> bool:
+    """role 的**类型判据单点**（issue #418）。
+
+    仓内此前把「role 须为 str」这条类型判据**写了三遍**，分布在三个不同载体上：
+      · 本模块 frontmatter_problem（**节点 frontmatter** 载体，本单点的定义处）；
+      · mdcg.check_recent_event（**recent 事件行**的写入闸）；
+      · mdcg.recent_record_ok（**recent 事件行**的读侧容错）。
+    三处载体不同（fm 契约 vs 事件行契约）⇒ **不合并实现**；但**类型判据这一条**
+    收成单点：三处都调本函数。缺省（None）一律合法（存量节点/旁路写入不带 role）。
+    """
+    return x is None or isinstance(x, str)
+
+
+# 生效条件：fm 为任意值、content 为节点正文（str 或 None，仅供后续扩展使用，当前判据不读它）时——fm 非 dict 返回单元素问题清单；否则逐项校验**下游按类型直接消费**的字段（condition_space/subgraph 须 dict，tags/non_applicable_conditions 须 list/tuple，importance/confidence/created_at/access_count/last_access/evidence_count 须 number，id/layer/role/sensitivity/verification_basis 须 str，bool 一律不算 number），返回按发现顺序的问题描述列表；全部合法（含字段缺省）返回空列表 []。无副作用、不抛异常。
+def frontmatter_problem(fm, content=None) -> list:
+    """单节点 frontmatter 的**类型可用性**判据（唯一单点，issue #146）。
+
+    病象（issue #146 现场）：`loads()` 对解析失败的取值行**保留原字符串**
+    （`except ValueError: fm[k] = v`）——一个手改漏了 `}` 的
+    `condition_space: {"a": 1` 就变成 `str`；随后 `MdCG._node_entry` 的
+    `(fm.get("condition_space") or {}).get(...)` 对 str 直接 `.get` 抛
+    AttributeError，且该调用在 `_scan_nodes` 的 `try` **之外** ⇒ 异常逃出
+    `MdCG.__init__`：**整库打不开、MCP 服务起不来**（一个坏文件炸全库）。
+    密级行改坏同族：`sensitivity` 变成非法值后 `_rank` 抛 AccessDenied，
+    炸全员检索。
+
+    为什么单点在这里：`loads` 是 fm 的唯一来源，而「哪些字段会被下游按类型
+    消费」是格式契约的一部分（与 `dumps` 的字段集同源）。判据写在读侧第二处
+    （如 `_scan_nodes` 内联、`get` 内联）就是两份判据各自漂移的老路——本仓
+    反复出现的缺陷族（见 `ccg_value_has_break` / `ccg_mark_present` 的同款
+    单点动因）。
+
+    边界（如实）：
+      · **只判类型，不判取值域**——`sensitivity` 的合法取值域在
+        `security.SENSITIVITY_ORDER`（本模块不 import security，免循环依赖），
+        由 `mdcos` 侧消费本判据时另判（#146③）。
+      · **缺省（None）一律合法**：存量节点本就不带这些键，本判据不得把
+        「未声明」判成「损坏」。
+      · bool **不算** number（`True` 是 `int` 子类，落盘会成 `importance: true`
+        ——与 add 拒 `node_id=True` 同款理由）。
+    """
+    if not isinstance(fm, dict):
+        return ["frontmatter 不是对象：%s" % type(fm).__name__]
+    problems = []
+
+    def _bad(key, want, got):
+        problems.append("%s 类型非法：期望 %s，实为 %s"
+                        % (key, want, type(got).__name__))
+
+    # (1) 下游直接取映射的字段：非 dict 即 AttributeError
+    #     （(fm.get("condition_space") or {}).get(...)）。
+    for _key in ("condition_space",):
+        _v = fm.get(_key)
+        if _v is not None and not isinstance(_v, dict):
+            _bad(_key, "dict", _v)
+    # (1)' subgraph 不是 dict-only：subgraph.declared() 兼容三种写法
+    #     （{nodes: [...]} / 纯 id 列表 / 内联对象列表）——list 形态是
+    #     合法的存量形态（md_cg 引用式写入即用 list）。只拒既非映射也
+    #     非序列的形态：写成 dict-only 会让 p8 的 subgraph=["a","b"]
+    #     被误判为损坏、整节点不可读（回归现场(2)）。
+    _v = fm.get("subgraph")
+    if _v is not None and not isinstance(_v, (dict, list, tuple)):
+        _bad("subgraph", "dict/list", _v)
+    # (2) 下游直接迭代/拼接的列表字段：str 会被逐字符迭代（静默错值）。
+    for _key in ("tags", "non_applicable_conditions", "edges"):
+        _v = fm.get(_key)
+        if _v is not None and not isinstance(_v, (list, tuple)):
+            _bad(_key, "list", _v)
+    # ②' 依赖/派生声明：`trust.as_deps` / `provenance.as_list` 明确容错
+    #     单值与逗号串（写路径归一为列表，但存量/外部手写件可能仍是串）
+    #     ⇒ 只拒「既非序列也非字符串」的形态，不把合法的单值形态误判为损坏。
+    for _key in ("depends_on", "derived_from"):
+        _v = fm.get(_key)
+        if _v is not None and not isinstance(_v, (list, tuple, str)):
+            _bad(_key, "list/str", _v)
+    # ③ 下游按数值直接消费的标量：str 会让排序/格式串异常，且
+    #    `float("0.5}")` 抛 ValueError 把读面炸掉。
+    for _key in ("importance", "confidence", "created_at", "access_count",
+                 "last_access", "evidence_count", "positive_evidence",
+                 "negative_evidence"):
+        _v = fm.get(_key)
+        if _v is None:
+            continue
+        if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+            _bad(_key, "number", _v)
+    # ④ 下游按字符串消费的标量（`str` 之外的形态会静默变成 repr 文本）。
+    # id 不在此列：存量毒文件（旧版本 add(123) 写出 / 外部编辑器落下的
+    # id: 123）是 legacy P3 的自愈腿——_scan_nodes 一律 str(nid) 归一后
+    # 入索引（归一是消费点的职责）。此处判损坏会让该腿失效：毒节点从
+    # 索引里消失、经归一 id 也读不回（回归现场(1)）。写面拒写与读面自愈
+    # 各司其职，判据不越权。
+    for _key in ("layer", "role", "sensitivity", "verification_basis",
+                 "writer", "session", "content_kind"):
+        _v = fm.get(_key)
+        if _v is None:
+            continue
+        # issue #418：role 走**类型判据单点** valid_role（与写面入参闸、recent
+        # 事件面同源）——同一判据不在这里再写一遍 isinstance。
+        _ok = valid_role(_v) if _key == "role" else isinstance(_v, str)
+        if not _ok:
+            _bad(_key, "str", _v)
+    return problems
+
+
 # 生效条件：value 的 str 形态含 "\n" 或 "\r" 时返回 True，否则 False。
 def ccg_value_has_break(value) -> bool:
     """CCG 行值是否含换行——含换行即可注入一行伪造的独立正文行。
@@ -360,10 +517,17 @@ def _ccg_heading_rest(line: str, mark: str):
       * `# 生效条件`、`#生效条件`、`# 生效条件：v`、`# 生效条件 v` → 命中；
       * `## 生效条件`、`  # 生效条件`（缩进）→ **不**命中（闸门同样不认二级标题/缩进标题）。
     """
-    m = re.match(r"^#\s*" + re.escape(mark), line or "")
+    line = line or ""
+    if not line.startswith("#"):
+        return None
+    pattern = _CCG_HEADING_PATTERNS.get(mark)
+    if pattern is None:
+        # 保留调用方传自定义字段的原语义，不缓存无限增长的字段名。
+        pattern = re.compile(r"^#\s*" + re.escape(mark))
+    m = pattern.match(line)
     if not m:
         return None
-    return (line or "")[m.end():]
+    return line[m.end():]
 
 
 # 生效条件：content 中存在 `# <mark>` 标题行（判据=_ccg_heading_rest 非 None；与写入闸门同一正则语义，冒号可有可无）时返回 True，否则 False。
@@ -384,6 +548,48 @@ def ccg_mark_present(content: str, mark: str) -> bool:
         if _ccg_heading_rest(ln, mark) is not None:
             return True
     return False
+
+
+# 生效条件：content 为真时逐行扫描——命中 marks 中任一要素的 CCG 标题行（判据单点 _ccg_heading_rest，`^#\s*<要素>` 冒号可有可无）即整段剥除：行内带值（`# 生效条件：v`／前缀式）只剥该行，裸标题连同其后首个非空、非标题行（该字段的值行，取值口径同 ccg_field_value）一并剥除；其余原行原样保留（含缩进）以 "\n" 连接返回；content 假值按空串返回。
+def _strip_ccg_segments(content, marks=CCG_MARKS):
+    """剥除 CCG 声明**整段字段**后的文本——剥除算法单点。
+
+    单点动因（N238 同族）：六要素允许无冒号形态（`# 不适用条件` + 换行 + 值行），
+    **值行才是内容本体**；只剥标题行会把该字段的正文留在正文里——同一条内容写成
+    带冒号时剥净、写成无冒号时残留，两种写法给出两种结论（该缺陷在
+    `consistency._body_text` 已按 N238 收口，本函数把**剥除算法本身**也收成一份，
+    防下游再各写一份循环而漂移）。调用方：`positive_body`（只剥不适用条件）与
+    `consistency._body_text`（剥全部六要素）。
+
+    判据一律走单点（`_ccg_heading_rest`，与写入闸门 data/policy.json 同一行语义）：
+    缩进标题与二级标题不构成「已声明」，与 `ccg_mark_present` 同边界。
+    """
+    lines = (content or "").split("\n")
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        rest = None
+        for mark in marks:
+            rest = _ccg_heading_rest(lines[i], mark)
+            if rest is not None:
+                break
+        if rest is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        i += 1
+        if rest.strip():
+            continue            # 行内已带值（冒号式 `# 字段：v` / 前缀式）→ 只剥该行
+        while i < n:            # 裸标题：其后首个非空、非标题行是值行，同剥
+            t = lines[i].strip()
+            if not t:
+                i += 1
+                continue
+            if t.startswith("#"):
+                break           # 下一个标题 ⇒ 本字段值为空，不消费
+            i += 1
+            break
+    return "\n".join(out)
 
 
 # 生效条件：content 中出现 "# {mark}：" 或 "# {mark}:"（中/英文冒号）或仅 "# {mark}" 标题行即把该 mark 计入 present 与 required_present；complete 为 required_present 覆盖全部 CCG_REQUIRED、all_present 为 present 覆盖全部 CCG_MARKS，ratio = len(required_present)/len(CCG_REQUIRED)，四键连同两个清单一起返回。
@@ -441,39 +647,45 @@ def is_placeholder_text(value) -> bool:
     return any(m in s for m in PLACEHOLDER_MARKERS)
 
 
-# 生效条件：content 中含 "# 不适用条件："（全角冒号）或 "# 不适用条件:"（半角冒号）即返回 True，两者都不出现返回 False。
+# 生效条件：content 中存在 NEG_FIELD（"不适用条件"）的 CCG 标题行（判据单点 ccg_mark_present，`^#\s*不适用条件`，冒号可有可无，与写入闸门同一行语义）时返回 True，否则 False。
 def has_non_applicable(content: str) -> bool:
     """是否声明了不适用条件——REJECT 路径成立的必要条件。
 
     没有不适用条件的节点在白箱下不能 REJECT（无法证明「不适用」），
     只能 ACCEPT 或 BLINDSPOT。这是第 1 篇第 10 章从 28%→88% 的关键。
+
+    A3（N238 同族残面）：判据单点 = `ccg_mark_present`——本函数原先只认
+    「`# 不适用条件：`／`# 不适用条件:`」两种**带冒号**的字面量，无冒号形态
+    （`# 不适用条件` + 换行 + 值行）被判成「没声明」：同一条正文写不写冒号
+    给出两种结论，而「冒号可有可无」已由单点定案（test_ccg_form_parity ①-⑦）。
+    消费面：索引条目 `has_neg_conditions`（mdcg `_entry` / rebuild / `_stage`），
+    进而 `export`/`insight`/`sustain`/`predict` 的统计与边界读数。
     """
-    return "# 不适用条件：" in content or "# 不适用条件:" in content
+    return ccg_mark_present(content, NEG_FIELD)
 
 
 #: 负条件字段名——它是**反例声明**，不是召回键
 NEG_FIELD = "不适用条件"
 
 
-# 生效条件：content 为 None 时按 "" 处理；逐行 strip 后，仅当该行以 "#" 开头且 lstrip("#").strip() 又以 NEG_FIELD 开头时丢弃该行，其余行原样保留（保留原缩进），返回保留行的 "\n".join。
+# 生效条件：content 为 None 时按 "" 处理；逐行剥除 NEG_FIELD 的整段 CCG 声明（剥除算法单点 _strip_ccg_segments——行内带值只剥该行，裸标题连同其后首个非空、非标题的值行一并剥除），其余行原样保留（含原缩进），返回保留行的 "\n".join。
 def positive_body(content: str) -> str:
-    """剥离 `# 不适用条件：` 行后的正文——负条件不作召回键。
+    """剥离 `# 不适用条件` 声明段后的正文——负条件不作召回键。
 
     不适用条件声明的是「什么时候**不**适用」，其触发词是反例。一旦把它当召回
     键，查询命中反例时节点反而被召回——**恰好在它不该适用的地方被召回**，属实
     质性错误。反例的正确去向是 `judge_qualification` 的 REJECT 路径（读
     `frontmatter.non_applicable_conditions`），而不是召回。
 
-    只剥离真正的 CCG 行（以 `#` 开头且字段名匹配），避免误伤正文里恰好以
-    「不适用条件」开头的普通句子。
+    只剥离真正的 CCG 行（判据单点 `_ccg_heading_rest`：`# <字段>` 标题前缀、
+    冒号可有可无），避免误伤正文里恰好以「不适用条件」开头的普通句子。
+
+    A3（N238 同族残面）：剥的必须是**整段字段**——无冒号形态（`# 不适用条件` +
+    换行 + 值行）原先只剥标题行，值行（内容本体）残留 ⇒ 反例词面照样进召回键
+    （`MdCG._like` 实测命中），与带冒号写法的行为相反。剥除算法收在单点
+    `_strip_ccg_segments`（与 `consistency._body_text` 共用一份循环）。
     """
-    keep = []
-    for ln in (content or "").split("\n"):
-        s = ln.strip()
-        if s.startswith("#") and s.lstrip("#").strip().startswith(NEG_FIELD):
-            continue
-        keep.append(ln)
-    return "\n".join(keep)
+    return _strip_ccg_segments(content, (NEG_FIELD,))
 
 
 # ---- 条件空间 → 生效条件声明 -------------------------------------------------

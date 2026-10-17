@@ -24,6 +24,7 @@
   md_cg/test_*.py         Python 侧测试套件
   compiler/tests/*.py     compiler 测试（#36 前漏冻）
   swarm/tests/*.py        swarm 测试（#36 前漏冻）
+  test/{hive_exec,hive_wm}_test.py   test/ 侧逐文件裁决可收件（A6；精确名冻结）
 """
 import hashlib
 import json
@@ -37,9 +38,22 @@ PATTERNS = [
     ("hive", "test_*.py"),
     ("scripts", "run_tests.py"),
     ("scripts", "test_*.py"),
+    # md_cg 递归面（issue #185）：run_tests 的发现面已递归（`md_cg/**/test_*.py`），
+    # 判据面必须同形递归，否则「跑什么 ⊆ 冻结什么」必报缺口——md_cg/whitebox_kb/
+    # wisdom/ 下的 7 条测试即本批新发现者，由此**明确纳入**冻结域。fnmatch 的 `*`
+    # 跨路径分隔符 ⇒ `md_cg/*/test_*.py` 覆盖任意深度的子目录；顶层
+    # `md_cg/test_*.py` 逐位不变地冻结顶层（两条互不重叠，无重复计数）。
     ("md_cg", "test_*.py"),
+    ("md_cg/*", "test_*.py"),
     ("compiler/tests", "*.py"),
     ("swarm/tests", "*.py"),
+    # test/（A6，2026-10-05）：与 scripts/run_tests.py 的 TEST_DIR_TESTS 具名裁决
+    # 清单同步——逐文件**精确名**冻结（fnmatch 无通配＝只认具名件）；未过逐文件
+    # 裁决的件不得进判据面。批次99 补收：chaos 套件的陈旧登记已同步（FI-M04 读码
+    # 代理断言改 AST 语义判据 + 去锁定点变异自证），其全量入口按预注追加。
+    ("test", "hive_exec_test.py"),
+    ("test", "hive_wm_test.py"),
+    ("test/chaos_injection", "run_all.py"),
 ]
 
 
@@ -49,12 +63,29 @@ def collect():
     for sub, pat in PATTERNS:
         base = os.path.join(HERE, sub)
         n = 0
-        if os.path.isdir(base):
+        pat_full = f"{sub}/{pat}"
+        if "*" in sub:
+            # 通配组（issue #185：`md_cg/*/test_*.py`）：判据与 coverage_gap 完全
+            # 同形（相对路径 fnmatch 于 `sub/pat`），故在 sub 首段目录下递归枚举；
+            # 若仍走 listdir，该组恒零命中——域覆盖判据认它、files 却永不含它（假牙）。
+            import fnmatch
+            import glob
+            root = os.path.join(HERE, sub.split("/")[0])
+            if os.path.isdir(root):
+                for full in sorted(glob.glob(os.path.join(root, "**", "*"),
+                                             recursive=True)):
+                    if not os.path.isfile(full):
+                        continue
+                    rel = os.path.relpath(full, HERE).replace("\\", "/")
+                    if fnmatch.fnmatch(rel, pat_full):
+                        files.append(rel)
+                        n += 1
+        elif os.path.isdir(base):
+            import fnmatch
             for name in sorted(os.listdir(base)):
                 full = os.path.join(base, name)
                 if not os.path.isfile(full):
                     continue
-                import fnmatch
                 if fnmatch.fnmatch(name, pat):
                     rel = os.path.relpath(full, HERE).replace("\\", "/")
                     files.append(rel)

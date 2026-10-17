@@ -10,6 +10,24 @@
    会形成确认偏差，永远发现不了「看起来没问题其实有问题」的记忆。
    `seed` 固定 → 同 seed 同样本（可复现、可审计，对齐本仓确定性白箱取向）。
 
+**issue #66 的两条口径（2026-10-09 DSH 端落文档，zcode 端裁定「一甲二乙」）**：
+
+* **seed（子项二·乙：可注入、默认仍 0）**：sample() 的 seed 本就是可注入参数
+  （sample(..., seed=None)，:280 seed = 0 if seed is None else seed）——**不传即 0**，
+  与既有读数逐字一致；显式传入才轮换。故「抽样面不轮换」不是缺陷，而是**默认取向**：
+  可复现、可审计对齐确定性白箱。_pick 另有已核实结论（:252-255）：层内候选 <= k 时**全量抽取**，
+  单节点分层每轮必中属**有意设计**（该层全部人口＝全量覆盖）；**seed 轮转只让大池层换人**，
+  小分层恒中占少数名额，且账本上可由 already_handled 如实读出。
+* **幂等账本（子项一·甲：维持现口径）**：_handled **只认 SCRUB_LOG 里 op=="decontaminate"
+  且 ok 为真的「改过的单条记录」**——批量汇总只是**读数**，不是处置凭证。
+  这是把「审计即状态」收窄成「**实际改动才是状态**」，属**刻意口径**，不是漏配：
+  跑过一轮但没动的条目**下轮仍会报**，那是设计意图（持续观察），不是重复劳动。
+  ⇒ 使用者若期望「跑过就不再报」，应改看 already_handled 读数，而非期望幂等名单增长。
+
+**issue #67（2026-10-09 DSH 端）**：_pick 的 3k 截断**只对有序池成立**；对照组
+（random 池，_pool_candidates 唯一不排序者）此前同样被截断 ⇒「随机基线」退化成
+「索引前 3k 名」。现由 ordered 形参区分：风险层截断不变，对照组取全池。
+
 ② **联想（associate）**
    从抽样节点出发三路邻域合并：
      关系链（`chain.walk`，带条件序列）· 子图层级（`subgraph.expand`）
@@ -41,6 +59,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import time
@@ -75,7 +94,13 @@ CONTAMINATION = {
     # 故 severity=info、处置仅 hint（不 weaken / 不 demote / 不删）。
     "not_yet": ("info", ("hint",)),
     "duplicate": ("medium", ("hint",)),
-    "orphan_noise": ("low", ("weaken", "demote")),
+    # #524：`demote` 在此规则下**不可达** —— 产出条件要求 `layer == "contextual"`（见下方 audit 的
+    #   orphan_noise 分支），而 demote 的执行条件是 `layer != "contextual"`（见 decontaminate 的
+    #   降级分支）⇒ 两者互斥 ⇒ 该动作永不执行。故删声明；**行为不变**（本来就不执行）。
+    #   三段证明：① `audit(min_severity="info")` ⇒ `n_issues=1`（issue 能造出）
+    #             ② `decontaminate` ⇒ `action="applied"` 而 `done=["weaken"]`（demote 未执行）
+    #             ③ `audit.issues[0].fix=["weaken","demote"]` 而 `done` 不含 demote（声明 vs 实际）
+    "orphan_noise": ("low", ("weaken",)),
     "unverified": ("info", ("hint",)),
 }
 SEVERITY_ORDER = {"high": 3, "medium": 2, "low": 1, "info": 0}
@@ -115,11 +140,13 @@ def _access(cg):
         return {}, {}
 
 
-# 生效条件：`from . import chain` 成功且 chain.adjacency(cg) 正常返回时返回该 dict，导入或调用抛任何异常时返回 {}。
+# 生效条件：`from . import chain` 成功且 chain.adjacency(cg, skip_archived=False) 正常返回时返回该 dict，导入或调用抛任何异常时返回 {}。
 def _adjacency(cg) -> dict:
     try:
         from . import chain
-        return chain.adjacency(cg)
+        # 维护面全量口径（2026-10-06 退役接线批次）：去污染抽查是维护写面，
+        # 退役节点仍可被抽查 ⇒ 显式旁路退役过滤（度数口径与接线前逐位一致）。
+        return chain.adjacency(cg, skip_archived=False)
     except Exception:
         return {}
 
@@ -141,6 +168,37 @@ def _log(cg, op: str, **rec) -> dict:
     except Exception:
         pass
     return rec
+
+
+#: 处置动作的**失败标记**（写侧 `done` 列表里的实际字面串，**单点**）。
+#: 判据按实际字符串定，不用通配占位——新增动作若引入新的失败形态，必须回到这里登记。
+#: 三态来源（`decontaminate` 的实修段）：
+#:   `weaken_failed:<Type>`   —— `_weaken` → `cg.verify` 抛异常（越权 / 保护 / 冲突）
+#:   `demote_failed:<Type>`   —— `cg._move_layer` 抛异常（保护闸 / 层闸）
+#:   `demote_state:<error>`   —— 层降级成功但生命周期状态推进失败（负路由，不抛）
+#: 第三条不以 `_failed:` 结尾，故**不能用 `*_failed:` 通配**——只认前缀会把它漏成「成功」。
+#: **为什么是显式三项而不是通配**：四项 `done.append` 落点已逐一枚举（成功两项
+#: "weaken"/"demote" + 失败三项），三项就是已知的**全部**失败形态；换成通配（如
+#: 匹配任意 `*failed*` 或 `state:`）会把**语义无关的合法动作名**也判成失败——那是
+#: **过度收紧方向**（合法成功处置被误判 ⇒ 幂等名单永不记账 ⇒ 每轮重复处置）。
+#: 新增动作必须回来登记：这是「枚举完备性」而不是「模式匹配」的取舍。
+ACTION_FAIL_MARKS = ("weaken_failed:", "demote_failed:", "demote_state:")
+
+
+# 生效条件：actions 为可迭代（None/空按无动作计）时，任一动作的字符串形式以 ACTION_FAIL_MARKS 之一开头即返回 False，否则返回 True；不抛（非字符串项先 str()）；
+def _actions_ok(actions) -> bool:
+    """本批处置动作是否**全部成功**（issue #411，**唯一判据单点**）。
+
+    为什么必须抽成单点：改前写侧无条件写 `ok=True`（`_log(cg, "decontaminate",
+    …, ok=True, …)`），而读侧 `_handled` 只认 `op=="decontaminate" and ok`——
+    失败只以字符串留在 `actions` 里，于是**无权身份跑一次就能把 (节点, 污染类型)
+    永久钉成「已处置」**，污染此后**永久不再被处置**（幂等名单被失败污染）。
+
+    这里只做「动作结果 → 布尔」这一件事；写侧把该布尔写进 `ok`，读侧（`_handled`
+    / `summary`）照旧**只读 `ok`**——**收成单点**，读侧不另写第二份判据。
+    """
+    return not any(str(a).startswith(ACTION_FAIL_MARKS)
+                   for a in (actions or ()))
 
 
 # 生效条件：仅当 read_jsonl(cg.root 下 SCRUB_LOG) 的记录 op=="decontaminate" 且 ok 为真时，把 (rec.get("node_id"), rec.get("kind")) 收进返回集合；无此类记录返回空集。
@@ -243,13 +301,25 @@ def _quota(n: int, strategy: str) -> dict:
     return out
 
 
-# 生效条件：k<=0 或 pool 为假值（空池）时返回 []，否则取池前 k*3 项后用 random.Random(f"{seed}:{stratum}") 稳定洗牌并返回前 k 项（池长不足 k*3 时对全池洗牌）。
-def _pick(pool, k: int, seed, stratum: str):
-    """从池中取 k 个：风险最高的 3k 个入池，再按 seed 稳定洗牌。"""
+# 生效条件：k<=0 或 pool 为假值（空池）时返回 []；否则 ordered 为真时先取池前 k*3 项（风险优先窗口），ordered 为假时**不截断**（无序池＝对照组 random，见 issue #67），随后一律用 random.Random(f"{seed}:{stratum}") 稳定洗牌并返回前 k 项（池长不足窗口时对全池洗牌）。
+def _pick(pool, k: int, seed, stratum: str, *, ordered: bool = True):
+    """从池中取 k 个：风险最高的 3k 个入池，再按 seed 稳定洗牌。
+
+    层内候选 ≤ k 时**全量抽取**——单节点分层（如 low_conf 全库 1 个）
+    因此每轮必中：这是**有意设计**（该层全部人口 = 全量覆盖，风险优先
+    持续观察），不是漏配轮转。issue #66 核实：seed 轮转只让大池层换人，
+    小分层恒中占少数名额、且账本上可由 `already_handled` 如实读出。
+
+    issue #67（2026-10-09 DSH 端）：**对照组（random 池）不得截断**。_pool_candidates
+    只对六个风险层排序（stale/hot/unverified/orphan/disputed/low_conf），random 池
+    是**唯一不排序**的池；对它取 [:k*3] 等于把「随机基线」变成「索引前 3k 名」——
+    对照面既非随机、又恒看不到后段人口，抽样结论无从代表全库。故 ordered=False。
+    风险层保持截断**不变**：那是「风险优先窗口」的有意设计，不属本 issue 面。
+    """
     if k <= 0 or not pool:
         return []
     cand = list(pool)
-    if len(cand) > k * 3:
+    if ordered and len(cand) > k * 3:
         cand = cand[:k * 3]
     random.Random(f"{seed}:{stratum}").shuffle(cand)
     return cand[:k]
@@ -276,7 +346,8 @@ def sample(cg, n: int = DEFAULT_SAMPLE, *, strategy: str = "stratified",
     quota = _quota(n, strategy)
     picked, seen = [], set()
     for s in STRATA:
-        for nid, reason in _pick(pools.get(s), quota.get(s, 0), seed, s):
+        for nid, reason in _pick(pools.get(s), quota.get(s, 0), seed, s,
+                                 ordered=(s != "random")):
             if nid in seen:
                 continue
             seen.add(nid)
@@ -285,7 +356,7 @@ def sample(cg, n: int = DEFAULT_SAMPLE, *, strategy: str = "stratified",
     if len(picked) < int(n):
         rest = [x for x in pools["random"] if x[0] not in seen]
         for nid, reason in _pick(rest, int(n) - len(picked), seed,
-                                 "random-fill"):
+                                 "random-fill", ordered=False):
             seen.add(nid)
             picked.append({"node_id": nid, "stratum": "random",
                            "reason": reason})
@@ -496,9 +567,22 @@ def _not_yet(fm, now):
     return None
 
 
-# 生效条件：对 content 取 kv_pairs、bigrams 和 polarity，遍历 related（若 related 为假值则视为空）的前 int(max_compare) 个 r，以 r["node_id"] 调 cg.get；若某 oid 节点可读非空，先在其 content 与 content 的共同键中找到值不同者并返回 {'with':oid,'via':r.get('via'),'why':'同键不同值：...'}；否则若极性乘积 <0 且双方 bigram 非空，且共享 bigram 数 >=3 且 ratio>=0.15，返回 {'with':oid,'via':r.get('via'),'why':'极性相反且共享内容：...'}；全部遍历完无命中则返回 None；
+# 生效条件：对 content 取 kv_pairs、bigrams 和 polarity，遍历 related（若 related 为假值则视为空）的前 int(max_compare) 个 r，以 r["node_id"] 调 cg.get；【#444】返回的 why **只含键名 + 不可逆摘要（同键不同值）/ 计数与占比（极性相反）**，两端正文原值与共享词面一律不进串（该串会经 verify 落进 fm 与 _trust.jsonl 等明文面）；若某 oid 节点可读非空，先在其 content 与 content 的共同键中找到值不同者并返回 {'with':oid,'via':r.get('via'),'why':'同键不同值：...'}；否则若极性乘积 <0 且双方 bigram 非空，且共享 bigram 数 >=3 且 ratio>=0.15，返回 {'with':oid,'via':r.get('via'),'why':'极性相反且共享内容：...'}；全部遍历完无命中则返回 None；
 def _contradiction(cg, content, related, max_compare=10):
-    """与同族节点比对：同键不同值 / 极性相反且共享 bigram。"""
+    """与同族节点比对：同键不同值 / 极性相反且共享 bigram。
+
+    issue #444（P0 密级泄漏，2026-10-17 U05c）：本函数产出的 `why` 会经
+    `add("contradiction", why)` → `_weaken` → `cg.verify(..., "weakened")` 写成
+    verify 的 **evidence**，进而落进 (a) 节点 frontmatter、(b) 对端节点自己的 .md、
+    (c) `_trust.jsonl` —— 三处**都是明文面**（加密只作用于正文，不作用于 fm 字段）。
+    修前 `why` 里是**两端正文原值**（同键不同值）或**共享 bigram 词面**（极性相反），
+    于是 private 正文被搬进低密级节点的明文面，`internal` 身份经 `mdcg_get` 即可读到。
+    现口径：**正文原值与词面一律不进证据串**——只留键名 + 不可逆摘要（8 位）/ 计数。
+    """
+    def _h(v):
+        """证据串用的**不可逆**摘要——正文原值不得进证据串（#444）。"""
+        return hashlib.sha1(str(v).encode("utf-8")).hexdigest()[:8]
+
     kv_a = _kv_pairs(content)
     bg_a, pol_a = bigrams(content or ""), _polarity(content)
     for r in (related or [])[:int(max_compare)]:
@@ -514,15 +598,17 @@ def _contradiction(cg, content, related, max_compare=10):
         for k in sorted(set(kv_a) & set(kv_b)):
             if kv_a[k] != kv_b[k]:
                 return {"with": oid, "via": r.get("via"),
-                        "why": f"同键不同值：{k}={kv_a[k]} vs {kv_b[k]}"}
+                        "why": f"同键不同值：{k}（本端 {_h(kv_a[k])} / "
+                               f"对端 {_h(kv_b[k])}）"}
         bg_b = bigrams(oc)
         if pol_a * _polarity(oc) < 0 and bg_a and bg_b:
             shared = bg_a & bg_b
             ratio = len(shared) / max(1, min(len(bg_a), len(bg_b)))
             if len(shared) >= 3 and ratio >= 0.15:
+                # 同 #444：共享 bigram **词面也是正文片段**，同属泄漏面 ⇒ 只留计数与占比。
                 return {"with": oid, "via": r.get("via"),
-                        "why": "极性相反且共享内容：" + "、".join(
-                            sorted(shared)[:5])}
+                        "why": f"极性相反且共享内容：共享片段 {len(shared)} 个"
+                               f"（占比 {ratio:.2f}），词面不入证据串"}
     return None
 
 
@@ -620,7 +706,7 @@ def audit(cg, node_ids=None, *, hops: int = 1, min_severity: str = "info",
             "t": now}
 
 
-# 生效条件：循环 max(1, int(times)) 次调用 cg.verify(nid, "scrub:"+kind+":"+str(detail)[:120], "weakened")，返回最后一次调用结果（times≤0 时按 1 次执行）。
+# 生效条件：循环 max(1, int(times)) 次调用 cg.verify(nid, "scrub:"+kind+":"+str(detail)[:120], "weakened")，返回最后一次调用结果（times≤0 时按 1 次执行）；【#444】detail 会进 verify 的 evidence（→ fm 明文面 / _trust.jsonl / 对端节点 .md），故**调用方传入的 detail 不得含正文原值**——contradiction 支已改为摘要，其它支传的是键名/日期类短值。
 def _weaken(cg, nid, kind, detail, times=1):
     res = None
     for _ in range(max(1, int(times))):
@@ -637,11 +723,18 @@ def decontaminate(cg, node_ids=None, *, kinds=None, dry_run: bool = True,
 
     动作：`weaken`（verify weakened → 反例+1、置信-0.15、跌破 0.2 自动降级）、
     `demote`（降级到情境层）、`hint`（只建议，不改）。保护节点跳过；永不删除。
+
+    读数口径（issue #66）：`already_handled` = 命中幂等名单（此前已处置过，
+    旧键 `skipped_done` 即此含义——不是「检查并跳过」）；`planned_dry_run`
+    = 本轮检查到、但本轮无任何处置动作（dry_run 登记计划未执行；实修恒 0）；
+    两者与 `applied` / `skipped_protected` / `hints` 构成逐条去向的互斥分类
+    （`checked_breakdown`，仅读数，不回喂 `_handled`）。
     """
     rep = audit(cg, node_ids, hops=hops, min_severity=min_severity)
     handled = _handled(cg)
     actions = []
-    n_applied = n_prot = n_done = n_hint = 0
+    n_applied = n_prot = n_done = n_hint = n_planned = 0
+    n_failed = 0                     # #411：本轮动作**未全成功**的条数（写进批次 ok）
 
     for issue in rep["issues"]:
         nid, kind = issue["node_id"], issue["kind"]
@@ -670,6 +763,7 @@ def decontaminate(cg, node_ids=None, *, kinds=None, dry_run: bool = True,
                             "applied": False})
             continue
         if dry_run:
+            n_planned += 1
             actions.append({"node_id": nid, "kind": kind,
                             "action": "planned",
                             "planned": list(CONTAMINATION[kind][1]),
@@ -686,7 +780,9 @@ def decontaminate(cg, node_ids=None, *, kinds=None, dry_run: bool = True,
             try:
                 fm = _fm_of(cg, nid, None)
                 if str(fm.get("layer") or "") != "contextual":
-                    cg._move_layer(nid, "contextual", reason=f"scrub:{kind}")
+                    # issue #469：override 必须下传（修前此处丢弃 ⇒ 受保护节点静默失败）
+                    cg._move_layer(nid, "contextual", reason=f"scrub:{kind}",
+                                   override=override)
                     # 层降级 = 生命周期降级（②）：状态同批推进（负路由，失败不抛）
                     _st = cg.set_state(nid, "demoted", reason=f"scrub:{kind}",
                                        actor=actor or "scrub")
@@ -695,19 +791,50 @@ def decontaminate(cg, node_ids=None, *, kinds=None, dry_run: bool = True,
             except Exception as exc:                      # noqa: BLE001
                 done.append(f"demote_failed:{type(exc).__name__}")
         n_applied += 1
-        _log(cg, "decontaminate", node_id=nid, kind=kind, ok=True,
+        _ok = _actions_ok(done)          # #411：失败不得写成「已处置」
+        if not _ok:
+            n_failed += 1
+        _log(cg, "decontaminate", node_id=nid, kind=kind, ok=_ok,
              actions=done, severity=issue["severity"], actor=actor)
         actions.append({"node_id": nid, "kind": kind, "action": "applied",
                         "done": done, "detail": issue["detail"],
                         "applied": True})
 
+    # 覆盖账（issue #66）：逐条去向的**互斥分类**（五键之和 = 本轮处置循环的
+    # issue 条数，kinds 过滤者除外），**只用于读数**——不回喂 `_handled`
+    # （幂等账本仍只认「改过」的单条记录，读法见 `_handled`）。
+    #   applied           本轮实际执行了处置动作（weaken/demote）
+    #   already_handled   命中幂等名单（此前已处置过）→「旧面孔」。
+    #                     旧键 `skipped_done` 的**实际含义就是它**——不是「检查
+    #                     过并跳过」，正名于此（旧键保留兼容，值恒等）。
+    #   planned_dry_run = dry_run 下**本会处置、因 dry_run 未遂**（**≠「无需处置」**；
+    #                     「无需处置」由 hint 一格承载）（原写「无任何处置动作」易误读，
+    #                     计划未执行）→「本轮检查面」。实修恒 0：检查出的可
+    #                     处置问题都会动手。它与 `already_handled` 语义相反：
+    #                     一个数「本轮新检查」，一个数「此前已处置（幂等存量）」。
+    #   protected         受保护跳过（`protect.is_protected` 拦下）
+    #   hint              声明只给建议（duplicate/unverified/not_yet，不动手）
+    breakdown = {"applied": n_applied, "already_handled": n_done,
+                 "planned_dry_run": n_planned, "protected": n_prot,
+                 "hint": n_hint}
     if not dry_run:
-        _log(cg, "decontaminate_batch", ok=True, applied=n_applied,
+        # #411：批次 ok 同样必须是**真实结果**（任一子条失败即 False），
+        # 否则 `summary` 的 batches/decontaminated 会把失败批次算成成功轮。
+        _log(cg, "decontaminate_batch", ok=(n_failed == 0), applied=n_applied,
+             failed_actions=n_failed,
+             # 覆盖账（issue #66）：分类明细只读数不回喂 `_handled`；
+             # `already_handled` 为 `skipped_done` 的正名（二者恒等）。
+             already_handled=n_done, planned_dry_run=n_planned,
              skipped_protected=n_prot, skipped_done=n_done, hints=n_hint,
-             actor=actor)
+             checked_breakdown=breakdown, actor=actor)
     return {"ok": True, "dry_run": dry_run, "n_issues": rep["n_issues"],
             "applied": n_applied, "skipped_protected": n_prot,
-            "skipped_done": n_done, "hints": n_hint, "actions": actions,
+            # 正名（issue #66）：`skipped_done` = 命中幂等名单，**非「检查并跳过」**；
+            # 兼容键保留（值恒等），新读数请用 `already_handled`。
+            "already_handled": n_done, "skipped_done": n_done,
+            "planned_dry_run": n_planned,
+            "hints": n_hint, "failed_actions": n_failed, "actions": actions,
+            "checked_breakdown": breakdown,
             "audit": rep, "t": time.time()}
 
 
@@ -848,6 +975,12 @@ def sweep(cg, *, n: int = DEFAULT_SAMPLE, seed=None, dry_run: bool = True,
            "decontaminate": dec, "calibration": cal, "t": time.time()}
     _log(cg, "sweep", n_sample=smp["n"], n_issues=rep["n_issues"],
          n_high_medium=len(hi), applied=dec["applied"], dry_run=dry_run,
+         # 覆盖账（issue #66）：轮级读数也带逐条去向分类——dry_run 轮是常驻
+         # 默认下**唯一的账**（批量记录仅在实修轮写），不带则「三个旧面孔 +
+         # 一个新问题」与「四个全新问题」在 last_sweep 读数上不可区分。
+         already_handled=dec["already_handled"],
+         planned_dry_run=dec["planned_dry_run"],
+         checked_breakdown=dec["checked_breakdown"],
          calibration=(cal.get("verdict") if cal.get("ok")
                       else cal.get("reason")))
     return out
@@ -859,19 +992,34 @@ def history(cg, limit: int = 100) -> dict:
     return {"n": len(recs), "records": recs[-int(limit):]}
 
 
-# 生效条件：读取 cg.root 下 SCRUB_LOG 的 JSONL 记录，过滤 op=="sweep" 得 sweeps、op=="decontaminate" 且 ok 为真得 decs；last 为 sweeps 最后一项或 None；返回 {'sweeps':len(sweeps),'decontaminated':len(decs),'last_sweep':last 的 t/n_issues/n_high_medium/applied/dry_run/calibration 或 None}；
+# 生效条件：读取 cg.root 下 SCRUB_LOG 的 JSONL 记录，过滤 op=="sweep" 得 sweeps、op=="decontaminate" 且 ok 为真得 decs、op=="decontaminate_batch" 且 ok 为真得 batches；last 为 sweeps 最后一项或 None；返回 {'sweeps':len(sweeps),'decontaminated':batches 的 applied 累计,'decontaminated_records':len(decs),'batches':len(batches),'last_sweep':last 的 t/n_issues/n_high_medium/applied/dry_run/already_handled/planned_dry_run/checked_breakdown/calibration 或 None}；
 def summary(cg) -> dict:
-    """给 health_os / 自维持循环用的只读摘要。"""
+    """给 health_os / 自维持循环用的只读摘要。
+
+    `decontaminated`（issue #66 口径修正）= 批量汇总记录的**累计 applied 之和**
+    ——「实际处置量」；原口径（`op="decontaminate"` 单条记录条数）另留
+    `decontaminated_records`，`batches` 为批量轮数——三键并置，信息不丢。
+    """
     recs = list(read_jsonl(os.path.join(cg.root, SCRUB_LOG)))
     sweeps = [r for r in recs if r.get("op") == "sweep"]
     decs = [r for r in recs if r.get("op") == "decontaminate" and r.get("ok")]
+    batches = [r for r in recs if r.get("op") == "decontaminate_batch"
+               and r.get("ok")]
     last = sweeps[-1] if sweeps else None
-    return {"sweeps": len(sweeps), "decontaminated": len(decs),
+    return {"sweeps": len(sweeps),
+            "decontaminated": sum(int(r.get("applied") or 0) for r in batches),
+            "decontaminated_records": len(decs),
+            "batches": len(batches),
             "last_sweep": ({"t": last.get("t"),
                             "n_issues": last.get("n_issues"),
                             "n_high_medium": last.get("n_high_medium"),
                             "applied": last.get("applied"),
                             "dry_run": last.get("dry_run"),
+                            # 覆盖账（issue #66）：轮读数可区分「旧面孔/新检查」；
+                            # 旧记录无此键 → None（向后兼容读数）。
+                            "already_handled": last.get("already_handled"),
+                            "planned_dry_run": last.get("planned_dry_run"),
+                            "checked_breakdown": last.get("checked_breakdown"),
                             "calibration": last.get("calibration")}
                            if last else None)}
 

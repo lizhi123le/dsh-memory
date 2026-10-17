@@ -12,6 +12,14 @@ import subprocess
 import sys
 import tempfile
 
+# 三档自治批次②（2026-10-02）**夹具隔离**：本守卫考的不是档位面（档位守卫 =
+# md_cg/test_autonomy_modes.py），故显式置 full 档——回到改动前「动作直落」的
+# 行为（本套的 forget/restore/review_decide 用例都假定软删真的发生），使断言
+# 意图逐条不变。子进程继承本进程 environ，故被拉起的 MCP server 同档。
+# env 键名从唯一真源表取（本文件不构成第二处字面量）。
+from md_cg import autonomy_modes as _autonomy_modes
+os.environ[_autonomy_modes.AUTONOMY_ENV_KEYS["mode"]] = "full"
+
 PASS = FAIL = 0
 FAILS = []
 
@@ -134,6 +142,23 @@ def main():
         rec = cli.call("mdcg_recall", {"query": "红按钮", "budget_tokens": 500})
         check("mdcg_recall 返回记忆包", "pack" in rec and rec["tokens_used"] <= rec["budget"],
               f"used={rec.get('tokens_used')}/{rec.get('budget')}")
+        n1_recall = next((p for p in rec.get("pack", []) if p.get("id") == "n1"), None)
+        check("mdcg_recall 保留原有 id / 正文 / 结果字段",
+              n1_recall is not None and n1_recall.get("content") == g.get("content")
+              and {"id", "score", "state", "tokens", "content",
+                   "frontmatter", "provenance"} <= set(n1_recall),
+              str(n1_recall.get("id") if n1_recall else None))
+        n1_metadata = (n1_recall or {}).get("metadata") or {}
+        check("mdcg_recall 核心 metadata 复用真实验证基底及验证态",
+              n1_recall is not None
+              and n1_metadata.get("state") == n1_recall.get("state")
+              and bool(n1_metadata.get("reason"))
+              and n1_metadata.get("verification_basis") == g["frontmatter"]["verification_basis"]
+              and n1_metadata.get("verification_state") == g["verification_state"],
+              str(n1_metadata))
+        check("mdcg_recall 未声明来源和检验强度时不造值，不展开内部日志",
+              set(n1_metadata) == {"state", "reason", "verification_state",
+                                   "verification_basis"}, str(sorted(n1_metadata)))
         rec_sem = cli.call("mdcg_recall", {"query": "红按钮", "budget_tokens": 500,
                                            "semantic": True})
         check("mdcg_recall 可启用第 6 路 semantic",
@@ -144,6 +169,10 @@ def main():
               bool(n1_sem) and any(pr.get("path") == "semantic"
                                    for pr in (n1_sem[0].get("provenance") or [])),
               str(n1_sem[0].get("provenance") if n1_sem else None)[:120])
+        check("semantic recall 的可靠性 metadata 与检索 provenance 分离",
+              bool(n1_sem) and n1_sem[0].get("metadata") == n1_metadata
+              and "provenance" not in n1_sem[0]["metadata"],
+              str(n1_sem[0].get("metadata") if n1_sem else None))
 
         # 4. 负记忆 / 未解 / 飞轮 / 反思
         print("\n【4】负记忆 / 未解 / 飞轮 / 反思")

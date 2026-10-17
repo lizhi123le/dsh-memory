@@ -54,7 +54,13 @@ _KEYED_EXTRA = ("include_work", "roles", "paths", "path_weights", "recall_only",
                 # 环境变量（MDCG_SEMANTIC/MDCG_EN_ATOMS/MDCG_UNIFY_QUERY…），它们
                 # 同样改变候选资格与打分。v14 只补了参数面，故另立一键
                 # （2026-09-24 修复：同 query 下切开关会命中另一口径的缓存 → 静默错答）。
-                "env_switch")
+                "env_switch", "bm25_access",
+                # #153（2026-10-12 DSH 端）：**索引代际**。写路径每次索引突变推进
+                # 代际（MdCGOS._on_index_mutation）⇒ 键随代际变化 ⇒ 旧代命中自然
+                # 失配，无需全清（全清会毁命中率，与 #154 性能面冲突）。
+                # 登记纪律同 env_switch：新增一个就登记一个——不登记等于让下一个人
+                # 看不出它承重（键用整份 extra，故漏登只影响可读性、不影响正确性）。
+                "index_gen")
 #: 不可稳定规范化的参数（自定义可调用）：非默认即**绕行缓存**（fail-closed）。
 _BYPASS_EXTRA = ("query_expand",)
 #: 影响检索结果的进程级开关（新增一个就登记一个——同 _KEYED_EXTRA 的纪律）。
@@ -65,7 +71,13 @@ _BYPASS_EXTRA = ("query_expand",)
 #: 直接改变融合结果，同属「漏登即跨口径串味」的一类。
 _ENV_SWITCHES = ("MDCG_SEMANTIC", "MDCG_EN_ATOMS", "MDCG_UNIFY_QUERY",
                  "MDCG_RETRIEVAL_PIPELINE", "MDCG_S7_FRESHNESS",
-                 "MDCG_CN_GRAMS", "MDCG_CHAIN_TYPES", "MDCG_TEMPORAL_GAMMA")
+                 "MDCG_CN_GRAMS", "MDCG_CHAIN_TYPES", "MDCG_TEMPORAL_GAMMA",
+                 "MDCG_RRF_CANDIDATES",
+                 # issue #197（2026-10-13）：名次可信度的**性质判据**开关。
+                 # 开启后在既有名单门之上追加 whole_tie（任意路）与
+                 # floor_mass（有下限声明的路）两条弃权分支 ⇒ 直接改变融合
+                 # 结果，同属「漏登即跨口径串味」的一类。
+                 "MDCG_RANK_CREDIBILITY")
 
 
 # 生效条件：无必需形参；返回 _ENV_SWITCHES 中每个变量名的 (名, 当前取值或 None) 元组（稳定、可哈希，随 query 缓存键一起参与比对）。
@@ -129,8 +141,22 @@ class HotCache:
         if isinstance(v, (set, frozenset)):
             return tuple(sorted((HotCache._canon(x) for x in v), key=repr))
         if isinstance(v, dict):
-            return tuple(sorted((str(k), HotCache._canon(x))
-                                for k, x in v.items()))
+            # #153（2026-10-12 DSH 端）：键片段用**三元组**（"k", 类型名, str(键)）。
+            # 修前是 (str(键), 值) 二元组，两个缺陷：
+            #   ① 撞键：`{1: 'x'}` 与 `{'1': 'x'}` 的 canon **逐位相同**
+            #      （int 1 与 str '1' 都 str 成 "1"）⇒ 语义不同的入参命中同一
+            #      缓存键，静默串结果；
+            #   ② 抛异常：`sorted(...)` 对 (str, 值) 二元组排序，键相同则比到
+            #      **值**——`_canon({1: None, '1': (1, 2)})` 比 None 与 tuple
+            #      ⇒ `TypeError: '<' not supported between instances of
+            #      'tuple' and 'NoneType'`，异常从 `search_rrf` 逃出（检索
+            #      入口整体 500）。context 是模型可控入参，形态不可信。
+            # 故：片段里带 `type(k).__name__` 消撞键；排序键**只取片段**
+            # （`key=lambda kv: kv[0]`，全是 str 元组 ⇒ 恒可比，不触值）。
+            return tuple(sorted(
+                ((("k", type(k).__name__, str(k)), HotCache._canon(x))
+                 for k, x in v.items()),
+                key=lambda kv: kv[0]))
         # 其余（含自定义对象/可调用）：repr 含内存地址 → 每次不同 →
         # 缓存永不命中（等价绕行），是**安全侧**失败（不串味）。
         return ("repr", repr(v))
@@ -161,7 +187,24 @@ class HotCache:
             return None
         self._stats["query_hits"] += 1
         self._queries.move_to_end(key)
-        return results, dict(meta)
+        # #153①（2026-10-12 DSH 端）：**出口一律深一层浅拷贝**——修前只
+        # `dict(meta)` 拷贝了 meta，`results` 是**缓存内部 list 的引用**：
+        # 调用方（检索后处理 / 排序 / 截断 / 上层 append）对返回值的任何原地
+        # 修改都会**写回缓存**，下一次命中就拿到被污染的「结果」——别名污染
+        # 是静默错答（不是性能问题）。行内元素 dict 同样按引用共享（`bm25`
+        # 的 rows 是 `(node_dict, score)`），故逐行浅拷贝、行内 dict 再拷贝。
+        return [HotCache._copy_row(r) for r in results], dict(meta)
+
+    @staticmethod
+    def _copy_row(row):
+        """query 结果行的**浅拷贝**（#153①）：list/tuple 保持原容器类型，
+        容器内的 dict 元素另拷一份，其余标量原样。"""
+        if isinstance(row, dict):
+            return dict(row)
+        if isinstance(row, (list, tuple)):
+            items = [dict(x) if isinstance(x, dict) else x for x in row]
+            return tuple(items) if isinstance(row, tuple) else items
+        return row
 
     def put_query(self, query, results, meta, k=20, layer=None,
                   session=None, branch=None, validity=None, view=None,

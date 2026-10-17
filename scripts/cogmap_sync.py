@@ -85,12 +85,14 @@ FUNC_DESC: dict[tuple[str, str], str] = {
     ("cg", "help"): "按需披露（投影后完整工具 / 参数文档即时取回）",
     ("cg", "status"): "验证态 / 双时间轴 / 履历（含冷路径队列；只读）",
     ("cg", "edges"): "三元组反查（派生边任意端 / 谓词 / 时间反查；只读）",
+    ("cg", "audit"): "证据审计视图（现值/出处链/两存备择/盲区/退役史；只读）",
     ("cg", "route"): "路由：意图→知识+建议能力",
     ("cg", "read"): "读取（按 id / 召回 / 预算）",
     ("cg", "write"): "写入（含冲突检测 / 闸门 / 审核）",
     ("cg", "goal"): "目标（写入 / 状态 / 清单）",
     ("cg", "task"): "任务实体（登记 / 计划 / 状态 / 结果；done 无结果拒收）",
     ("cg", "recent"): "最近记忆（事件窗口）",
+    ("cg", "state_event"): "状态事件记账（追加五元事件；查询走 stg(state_chain)）",
     ("cg", "verify"): "外部裁决回填（节点证据验证）",
     ("cg", "review"): "审核队列（DEFER / 提案裁决）",
     ("cg", "forget"): "主动遗忘 / 恢复",
@@ -119,6 +121,7 @@ FUNC_DESC: dict[tuple[str, str], str] = {
     ("stg", "timeline"): "时间线",
     ("stg", "anchors"): "锚点检索（时空窗口）",
     ("stg", "consistency"): "时空一致性",
+    ("stg", "state_chain"): "状态槽位投影（现值 / 区间 / 变迁史）",
     ("whitebox", "ask"): "白箱问答",
     ("whitebox", "remember"): "白箱编码（知识写入能力库）",
     ("whitebox", "verify_encoding"): "验证编码能力（写入口令→追问命中）",
@@ -541,10 +544,10 @@ def _check_doc(e: dict, dname: str, text: str, sections: list[tuple[str, str, st
                 )
 
     # 2) op / 工具名引用 ⊆ 真源
-    valid_ops = set(e["cg_ops"]) | set(e["stg_ops"])
-    for op in sorted(set(_CG_OP_RE.findall(text)) - valid_ops):
+    #    按基元各用各集合——并集同服两循环会让 cg(op=仅stg)/stg(op=仅cg) 跨基元误引零报错通过
+    for op in sorted(set(_CG_OP_RE.findall(text)) - set(e["cg_ops"])):
         errors.append(f"{dname} 引用了不存在的 cg op：cg(op={op})")
-    for op in sorted(set(_STG_OP_RE.findall(text)) - valid_ops):
+    for op in sorted(set(_STG_OP_RE.findall(text)) - set(e["stg_ops"])):
         errors.append(f"{dname} 引用了不存在的 stg op：stg(op={op})")
     valid_names = set(e["mdcg_tools"]) | set(NAME_ALLOWLIST)
     for name in sorted(set(_MDCG_RE.findall(text)) - valid_names):

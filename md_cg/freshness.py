@@ -83,6 +83,7 @@ import os
 import time
 
 from .fsutil import append_jsonl, read_jsonl
+from . import protect
 # `_maintain.jsonl` 与保护下限的**单一真源**在 weights（同族留痕共用一份文件名）
 from .weights import (APPLY_DELTA, IMPORTANCE_PROTECT, MAINTAIN_LOG,
                       node_importance)
@@ -179,22 +180,31 @@ def resolve_gamma(gamma=None) -> float:
 # 核（一律经 time_core；本模块不写指数核）
 # --------------------------------------------------------------------------
 
-# 生效条件：gamma 与 dt_days（单位=天）任意可转 float 时，返回 time_core.cred_factor(gamma, dt_days, floor, ceil)；dt 非有限值（inf/nan）时同样交给 cred_factor（inf → 取 floor）；
+# 生效条件：gamma 与 dt_days（单位=天）任意可转 float 时，返回 time_core.cred_factor(gamma, dt_days, floor, ceil)；dt 非有限值（inf/nan）时同样交给 cred_factor（inf → 取 floor）；enabled 为 None（缺省）时自算（模块级 enabled()），显式传 bool 时按传入值——两者皆假值即恒返回 1.0；
 def decay_factor(gamma: float, dt_days: float, floor: float = SCORE_FLOOR,
-                 ceil: float = SCORE_CEIL) -> float:
+                 ceil: float = SCORE_CEIL, enabled=None) -> float:
     """时间衰减乘子 `e^(-γ·Δt)`（**核来自唯一权威** `time_core.cred_factor`）。
 
     ⚠ `dt_days` 的单位**必须**是「天」（`DT_UNIT`）；调用方负责换算，
     换算单点是 `entry_weight`（`(now - created_at) / SECONDS_PER_DAY`）。
+
+    `enabled`（N274）：None=自算（默认，行为与改动前逐位一致）；显式传
+    bool 时不再自算——供 `entry_weight`/`_score` 把开关**循环外解析一次**
+    后透传，消掉逐节点 env 读取。自算分支写 `globals()["enabled"]()` 而非
+    直接 `enabled()`：形参同名会遮蔽模块函数，而 `globals()` 的解析语义与
+    改前那句 `enabled()` 逐位一致（含测试对模块函数的打桩/替换面）。
     """
-    if not enabled():
+    if enabled is None:
+        enabled = globals()["enabled"]()
+    if not enabled:
         return 1.0
     return _tc.cred_factor(float(gamma), float(dt_days), float(floor),
                            float(ceil))
 
 
-# 生效条件：access_count 与 last_access 任意（不可转数值按 0 处理）、importance 任意可转 float；按 REFRESH_PARAMS 的三档判定返回 1.0+gain / 1.0−gain / 1.0；
-def refresh_factor(access_count=0, last_access=0, importance=0.0) -> float:
+# 生效条件：access_count 与 last_access 任意（不可转数值按 0 处理）、importance 任意可转 float；enabled 为 None（缺省）时自算（模块级 enabled()），显式传 bool 时按传入值——两者皆假值即恒返回 1.0；否则按 REFRESH_PARAMS 的三档判定返回 1.0+gain / 1.0−gain / 1.0；
+def refresh_factor(access_count=0, last_access=0, importance=0.0,
+                   enabled=None) -> float:
     """访问刷新/降权乘子（**门槛与步长照抄 AEIS** `consolidate_cycle`）。
 
     判定序（与 AEIS 同序同门）：
@@ -209,8 +219,13 @@ def refresh_factor(access_count=0, last_access=0, importance=0.0) -> float:
     在**从未被访问**（`access_count == 0`）时也为真——照抄原样会让「刚写、
     从未调用的高重要度节点」白拿一次刷新。加此闸后「未被调用」只能不刷新，
     不会反被奖励（语义仍与 §7.1「被经常调用的记忆其权重被刷新」一致）。
+
+    `enabled`（N274）：None=自算（默认，行为与改动前逐位一致）；显式传
+    bool 时不再自算——与 `decay_factor` 同一透传口径（见其 docstring）。
     """
-    if not enabled():
+    if enabled is None:
+        enabled = globals()["enabled"]()
+    if not enabled:
         return 1.0
     p = REFRESH_PARAMS
     try:
@@ -226,7 +241,45 @@ def refresh_factor(access_count=0, last_access=0, importance=0.0) -> float:
     return 1.0
 
 
-# 生效条件：entry 为可取 protected / importance 的映射；protected 为假值时返回 SCORE_FLOOR；为真值时返回 max(SCORE_FLOOR, min(1.0, IMPORTANCE_PROTECT / importance))（importance 不可转数值或 ≤0 时按 1.0 处理）；
+#: 裸 entry 探针的假 node_id（`protect.is_protected` 的 `(cg, node_id)` 形态所需；
+#: 真实节点 id 来自文件名/显式声明，不含 NUL ⇒ 与既有索引键不可能相撞）。
+_ENTRY_PROBE_ID = "\x00entry-probe"
+
+
+class _EntryProbe:
+    """裸索引条目 → `protect.is_protected` 所需的 `(cg, node_id)` 形态（**零规则载体**）。
+
+    #378（2026-10-14）：衰减下界此前只读 `entry["protected"]` 一位，漏了
+    `protect.is_protected` 的**层保护**（layer ∈ {self, anchor}）与**按分保护**
+    ——layer=anchor 或按分受保护的节点会一路衰减穿过保护线（「自动失去保护」，
+    正是本模块 §7.3 要挡住的移植隐患）。本类**不复制任何判据**——规则单点仍是
+    `protect.is_protected`——只把调用方手里已有的条目摆成该判据所需的索引快照
+    形态。刻意**不提供** `_maybe_reload_index`（探活分支取不到即跳过）且
+    `get()` 恒返回 None（门控字段回退读文件的分支在此无文件可读、**不抛异常**）
+    ⇒ 判定 100% 基于传入映射：零 IO（`entry_weight` 是**检索期取数点**，
+    热路径上**不得读盘**，否则 §7.2 卡点一破）。
+    """
+
+    __slots__ = ("index",)
+
+    def __init__(self, entry):
+        self.index = {"nodes": {_ENTRY_PROBE_ID: entry if isinstance(entry, dict)
+                                else {}}}
+
+    def get(self, node_id=None):        # protect._fm 的回退分支：探针无文件可读
+        return None
+
+
+def _is_protected_entry(entry) -> tuple:
+    """裸索引条目的「不可遗忘」判定 → `(是否受保护, 原因)`。
+
+    判据单点＝**`protect.is_protected`**（层保护 self/anchor ∪ 显式 protected 位 ∪
+    按分保护 ≥0.70 且来源缺省/hint）；本函数只负责把它喂给判据，不自带任何规则。
+    """
+    return protect.is_protected(_EntryProbe(entry), _ENTRY_PROBE_ID)
+
+
+# 生效条件：entry 为可取 protected / layer / importance / importance_source 的映射；经 protect.is_protected（∪ 原显式 protected 位）判为**未受保护**时返回 SCORE_FLOOR；受保护时返回 max(SCORE_FLOOR, min(1.0, IMPORTANCE_PROTECT / importance))（importance 不可转数值或 ≤0 时按 1.0 处理）；
 def protected_floor(entry) -> float:
     """受保护节点的**衰减乘子下界**（§7.3 的第二道闸）。
 
@@ -240,7 +293,12 @@ def protected_floor(entry) -> float:
       乘子取 1.0（不衰减），同样不损失保护。
     """
     e = entry or {}
-    if not e.get("protected"):
+    # #378（2026-10-14）：判据改为**共用** `protect.is_protected`（∪ 原显式
+    # protected 位——超集，那位照旧短路，既有判定一字不变）：层保护（anchor/self）
+    # 与按分保护（≥0.70 且来源缺省/hint）同样享有下界，衰减不可能把它们
+    # 推过保护线。`importance_source` 必须已在取数面（`entry_weight`）里带上，
+    # 否则「机器推断分」会被误当存量缺省而认回保护（issue50-e 的反向）。
+    if not (e.get("protected") or _is_protected_entry(e)[0]):
         return SCORE_FLOOR
     try:
         imp = float(e.get("importance") or 0.0)
@@ -251,8 +309,8 @@ def protected_floor(entry) -> float:
     return max(SCORE_FLOOR, min(1.0, IMPORTANCE_PROTECT / imp))
 
 
-# 生效条件：entry 为可取 created_at / access_count / last_access / importance / protected 的映射；fm 为真值时上述五个键优先取自 fm（缺键回落 entry）；now 为假值（None）时取 freshness_now()；无条件返回 (乘子, 依据 dict)——乘子 = decay_factor(gamma, |now-created_at|/86400, protected_floor(取数后的映射), SCORE_CEIL) × refresh_factor(...)；created_at 缺失/不可转数值/≤0 时 dt_days 取 inf（判「距参照无穷远」，由 floor 兜住）；
-def entry_weight(entry, now=None, gamma=None, fm=None) -> tuple:
+# 生效条件：entry 为可取 created_at / access_count / last_access / importance / protected / layer / importance_source 的映射；fm 为真值时上述七个键优先取自 fm（缺键回落 entry）；now 为假值（None）时取 freshness_now()；enabled 为 None（缺省）时自算（模块级 enabled()），显式传 bool 时按传入值——两者皆假值即早退返回 (1.0, {"disabled": True})（早退先于 now/γ 解析，与改前同序）；否则无条件返回 (乘子, 依据 dict)——乘子 = decay_factor(gamma, |now-created_at|/86400, protected_floor(取数后的映射), SCORE_CEIL, enabled=…) × refresh_factor(..., enabled=…)；created_at 缺失/不可转数值/≤0 时 dt_days 取 inf（判「距参照无穷远」，由 floor 兜住）；
+def entry_weight(entry, now=None, gamma=None, fm=None, enabled=None) -> tuple:
     """索引条目 → 分数乘子 `(乘子, 依据)`（**检索期唯一取数点**，免读文件）。
 
     `entry` 直接来自索引快照（`_node_entry` 已落 `created_at` /
@@ -260,16 +318,27 @@ def entry_weight(entry, now=None, gamma=None, fm=None) -> tuple:
 
     `fm` 为可选覆盖源（写面刚落的 frontmatter 可能比索引条目新）：只为
     避免在热路径上拷贝 dict 而设，取数优先级 `fm > entry > 缺省`。
+
+    `enabled`（N274）：None=自算（默认，行为与改动前逐位一致）；显式传
+    bool 时不再自算，且向下透传给 `decay_factor`/`refresh_factor`——它们
+    同样不再各自读 env。自算分支经 `globals()["enabled"]()`（形参遮蔽，
+    解析语义同改前的 `enabled()`，见 `decay_factor` 同注）。
     """
     e = entry or {}
+    # #378：取数面必须把 `layer` 与 `importance_source` 带上——`protected_floor`
+    # 消费的是本函数的 `src`，漏了这两键就等于给下界判据喂了一份**残件**
+    # （层保护无 layer 可判；按分保护把 heuristic 误当缺省来源）。键集只增不改，
+    # 其余四键的取值口径与优先级（fm > entry > 缺省）逐位不变。
     keys = ("created_at", "access_count", "last_access", "importance",
-            "protected")
+            "protected", "layer", "importance_source")
     if fm is not None:
         src = {k: (fm.get(k) if fm.get(k) is not None else e.get(k))
                for k in keys}
     else:
         src = {k: e.get(k) for k in keys}
-    if not enabled():
+    if enabled is None:
+        enabled = globals()["enabled"]()
+    if not enabled:
         return 1.0, {"disabled": True}
     g = resolve_gamma(gamma)
     ref = freshness_now() if now is None else float(now)
@@ -286,9 +355,9 @@ def entry_weight(entry, now=None, gamma=None, fm=None) -> tuple:
         # 微变）且两侧跨语言同值。详见 DT_QUANTUM_DAYS 的说明。
         dt_days = float(int(dt_days / DT_QUANTUM_DAYS)) * DT_QUANTUM_DAYS
     floor = protected_floor(src)
-    d = decay_factor(g, dt_days, floor, SCORE_CEIL)
+    d = decay_factor(g, dt_days, floor, SCORE_CEIL, enabled=enabled)
     r = refresh_factor(src.get("access_count"), src.get("last_access"),
-                       src.get("importance"))
+                       src.get("importance"), enabled=enabled)
     return d * r, {"gamma": g, "dt_days": dt_days, "unit": DT_UNIT,
                    "decay": d, "refresh": r, "floor": floor,
                    "protected": bool(src.get("protected"))}
@@ -298,7 +367,7 @@ def entry_weight(entry, now=None, gamma=None, fm=None) -> tuple:
 # 三件套：预演 / 逐节点留痕 / 反向 apply（与 weights.recalc 同款）
 # --------------------------------------------------------------------------
 
-# 生效条件：cg.index["nodes"] 为 dict 时按 layer 过滤、limit 为真值才截断；dry-run 只出报表；apply=True 时逐节点把乘子（round 6）写入 frontmatter.freshness_weight 与 freshness_components，乘子 < DEMOTE_BELOW 时另写 freshness_state="degraded"（**只标记，不删记录**），乘子下降且 demote_layer 给定时经 cg._move_layer（内含 protect.guard_move）搬迁；每条 append_jsonl(action="freshness") 后 rebuild_index；返回报表 dict；
+# 生效条件：cg.index["nodes"] 为 dict 时按 layer 过滤、limit 为真值才截断；dry-run 只出报表（**不接档位闸**——零写盘面照旧）；apply=True 时先经 autonomy_modes.e_gate() 档位判定（补强批次 v1.2·E 面接线，位置＝任何盘面写入之前）：非 ALLOW（plan 档无计划）即经 forbidden_result() fail-closed 早退（零写盘、零审计行、带 hint），ALLOW（confirm/full）则逐节点把乘子（round 6）写入 frontmatter.freshness_weight 与 freshness_components，乘子 < DEMOTE_BELOW 时另写 freshness_state="degraded"（**只标记，不删记录**），乘子下降且 demote_layer 给定时经 cg._move_layer（内含 protect.guard_move）搬迁；每条 append_jsonl(action="freshness") 后 rebuild_index；返回报表 dict；
 def recalc(cg, layer=None, limit=None, apply=False, min_delta=APPLY_DELTA,
            actor="maintain", dry_run_samples=10, now=None, demote_layer=None):
     """刷新/衰减权重的重算（**可预演 + 逐节点留痕 + 可回滚**）。
@@ -312,6 +381,12 @@ def recalc(cg, layer=None, limit=None, apply=False, min_delta=APPLY_DELTA,
     `freshness_state="degraded"` 标记；要搬迁层位时给出 `demote_layer`，
     走既有 `_move_layer`（其内已调 `protect.guard_move`，受保护节点需显式
     `override`）——不新写第二条搬迁路径。
+
+    **档位闸（补强批次 v1.2·E 面接线）**：`apply=True` 的**写盘前**先经
+    `autonomy_modes.e_gate()`（设计 §三 plan 档 E「须命中计划步骤」）——
+    plan 档无计划 ⇒ `forbidden_result()` fail-closed 早退（零写盘、零审计行）；
+    confirm/full ⇒ ALLOW，**原链原样**（逐位不变）。`apply=False`（预演）
+    不接闸：零写盘面不属「变更」。
     """
     nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}
     ids = [nid for nid, e in list(nodes.items())
@@ -350,6 +425,16 @@ def recalc(cg, layer=None, limit=None, apply=False, min_delta=APPLY_DELTA,
             samples.append(plan)
     written, degraded = 0, 0
     if apply:
+        # 三档自治（补强批次 v1.2·E 面接线，设计 §三 plan 档 E「须命中计划步骤」）：
+        # E 类动作**写盘前**的档位判定单点。本函数无独立资格闸（逐节点取数在下方
+        # 循环里、取不到即 skip），故闸口取「进入写盘支路的第一行」＝任何盘面写入
+        # 之前；放行分支即原链原样（confirm/full 逐位不变），plan 档无计划
+        # ⇒ fail-closed 早退，**零写盘、零 _maintain.jsonl 行**。
+        from . import autonomy_modes as _am
+        _dec = _am.e_gate()
+        if _dec["decision"] != _am.ALLOW:
+            return _am.forbidden_result(_dec, action="freshness", dry_run=False,
+                                        written=0, batch=batch)
         if demote_layer:
             bind_move_layer(cg)         # 跨层降级走既有 _move_layer（现绑）
         for plan in planned:

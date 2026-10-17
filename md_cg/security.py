@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import uuid
 
@@ -68,6 +69,40 @@ def _rank(level: str) -> int:
         raise AccessDenied(f"未知敏感度/密级：{level}") from None
 
 
+# 生效条件：target_sensitivity / incoming_sensitivity 为 SENSITIVITY_ORDER 成员或 None
+# （None 按 DEFAULT_SENSITIVITY 处理）时，返回「把 incoming 内容的明文并入 target 节点
+# **是否导致该内容的有效密级下降**」＝ incoming 密级**严格高于** target 密级（合并后它按
+# target 的低档可见）；任一形参非法（_rank 抛 AccessDenied）时**按降密级处理**
+# （fail-closed：判不了就不许合并）。
+def merge_downgrades(target_sensitivity: str, incoming_sensitivity: str) -> bool:
+    """合并是否**降密级** —— 唯一判据单点（issue #148）。
+
+    病象：声明 private 的短记忆经 CONVERGE（writelimit.converge_into）或 MERGE
+    （forgetting.reinforce）**明文并入更早的 internal 节点**，而目标节点的
+    sensitivity **不变** ⇒ 该 private 明文就此获得 internal 的可见性（降密级泄漏，
+    访客可读）。
+
+    调用点：`writelimit.converge_into` / `forgetting.reinforce` —— 两者**落盘前**
+    一律经本函数，判为降密级即 **fail-closed 不写盘**；**不另写第二份判据**。
+
+    ★方向（本判据最易写反处，实测踩到过）：密级阶梯
+    public(0) < internal(1) < restricted(2) < private(3) < secret(4)；
+    病象是 **private(3) 并入 internal(1)** —— incoming 排名**更高**，合并后它只
+    按 internal 档被看见 ⇒ 该内容被**降级**。故判据为 `new > tgt`（不是 `<`）。
+
+    不适用条件：只判「incoming 密级高于目标 ⇒ 被降级」这一件事——同档合并照旧
+    放行；**低密级并入高密级节点**（incoming < target，内容变得更不可见）不在本
+    判据范围（非泄漏），仍由既有层闸/保护闸管；本函数不评价内容相关性、不替代
+    protect.guard_overwrite。
+    """
+    try:
+        tgt = _rank(target_sensitivity or DEFAULT_SENSITIVITY)
+        new = _rank(incoming_sensitivity or DEFAULT_SENSITIVITY)
+    except AccessDenied:
+        return True                      # fail-closed：判不了就不许合并
+    return new > tgt
+
+
 # 生效条件：全部形参均可省略、clearance 默认取模块常量 DEFAULT_SENSITIVITY，构造时先经 _rank(clearance) 校验，随后 session 为假值（含空串）回落为 sess_+uuid 十二位、role 假值回落 "system"、expires_at 为假值（含 0）置 None、layers_allow/ops_allow 为 None 时保持 None 否则转 tuple、theory_ok 经 bool() 转换。
 class Principal:
     """调用方身份（一次会话一个）。
@@ -99,7 +134,7 @@ class Principal:
     theory_version —— 当前声明的协议版本（审计与 whoami 用）
     """
 
-# 生效条件：clearance 须为模块级常量 SENSITIVITY_ORDER 成员（否则 _rank 抛 AccessDenied），session 为假值（含 None/空串）时生成 sess_ 随机串，expires_at 为假值（含 None/0）时存 None 否则 float(expires_at)，layers_allow/ops_allow 为 None 时存 None 否则 tuple 化。
+# 生效条件：clearance 须为模块级常量 SENSITIVITY_ORDER 成员（否则 _rank 抛 AccessDenied），session 为假值（含 None/空串）时生成 sess_ 随机串并把 session_auto 置 True（未获声明的进程自动随机；写归因三态收口的识别位，消费方 MdCGSecure._attributed_session），session 真值时原样采用并把 session_auto 置 False（显式声明的来源），expires_at 为假值（含 None/0）时存 None 否则 float(expires_at)，layers_allow/ops_allow 为 None 时存 None 否则 tuple 化。
     def __init__(self, tenant: str = "default", actor: str = "system",
                  clearance: str = DEFAULT_SENSITIVITY, can_write: bool = True,
                  can_admin: bool = False, session: str = None,
@@ -114,7 +149,19 @@ class Principal:
         self.clearance = clearance
         self.can_write = can_write
         self.can_admin = can_admin
-        self.session = session or ("sess_" + uuid.uuid4().hex[:12])
+        if session:
+            self.session = session
+            self.session_auto = False
+        else:
+            self.session = "sess_" + uuid.uuid4().hex[:12]
+            # 归因三态（2026-10-07 设计者裁定「会话身份三态」）：本值是「未获
+            # 任何声明来源」的进程自动随机——**只标记来源、不改值**（绑定档的
+            # 读回判据锚定值本身，见 mdcos._readable；值语义由 test_p45 A1/C5
+            # 钉死）。写归因落盘时由 MdCGSecure._attributed_session 把该态收口
+            # 为 'unattributed'。**赋值方**须知：凡把 session 改写为声明值处
+            # （_apply_attribution / serve 的 env 注入 / tokens.narrowed_principal
+            # 的复制传导）必须同步维护本标记，否则收口会把声明值误当自动随机。
+            self.session_auto = True
         # 归因维度（嵌套身份）：只入审计（_audit/_recent），不参与权限判定。
         # 权限域仍由令牌记录决定（tokens.ROLE_SPECS），与 harness/unit 无关。
         # 受控例外：MCP 请求级 `as_unit` 收窄（tokens.narrowed_principal）产出的是
@@ -343,22 +390,156 @@ class TenantRegistry:
 
 # P1-4（批次 26，外部审查报告）：工具路径参数的根白名单——ingest/export/link
 # 的 path/out 是模型可控输入，原样透传 = 任意文件读（/etc/passwd 进图）与
-# 任意文件写（evidence export 的 out）。校验语义与 HIVE_READ_ROOTS 同构：
-# **env 未设置 = 放开**（默认部署零行为变更，与 2026-09-19 的读放开裁定
-# 精神一致）；**设置了 = realpath 落根内否则拒**（fail-closed），`..` 与
-# 绝对路径穿越在 realpath 归一后自然被涵盖。支持 os.pathsep 分隔多根。
-# 生效条件：env_var 环境变量去空白后为空、或 path 为 None/空串时直接返回（不约束）；否则取 realpath(expanduser(path))，与 env 值按 os.pathsep 切分的每个根做「相等或以根+os.sep 为前缀」判定，任一命中即返回；全部未命中抛 PermissionError（含 what/原 path/realpath/roots 的拒绝说明）。
+# 任意文件写（evidence export 的 out）。校验语义：**未配置不再放开**。
+#
+# 语义（三级回落链）——设计者 2026-10-10 裁定「15 a」原话：
+#   「记忆写入当然是用 mdcg 的实际配置库。如果没配置，以工作区优先，并配置。」
+#   ① env_var（`MDCG_INGEST_ROOT` / `MDCG_EXPORT_ROOT`）已配置 ⇒ 用它
+#      （os.pathsep 多根）；realpath 落根内否则拒（fail-closed）。
+#   ② env_var 未配置 ⇒ 回落 **mdcg 实际配置库根** = `datapath.mdcg_root()`
+#      （`MDCG_ROOT` → `paths.json` 的 "root" → 用户级数据根）。**只在确有显式
+#      配置、或该库根目录已存在时**才认——否则把「已经装着记忆的默认库」弃用、
+#      把根改到工作区，正是 `datapath.py` 头注记载的「记忆真源分裂成两处」事故
+#      形态（issue #18 相邻问题，数据丢失级）。
+#   ③ 连库根也无（空白态：env 与 paths.json 都没配，且默认库根目录不存在）
+#      ⇒ **以工作区优先，并把它配置下来**：白名单根取**工作区**（进程 cwd，
+#      `os.path.realpath(os.getcwd())`），并写进**用户级** `paths.json` 的
+#      "root" 键（`datapath.set_user_root`，不碰 env、不写注册表）——下一轮即由
+#      ② 读到它，故这是**一次性**动作（幂等，见 `_persist_workspace_root`）。
+# `..` 与绝对路径穿越在 realpath 归一后自然被涵盖。支持 os.pathsep 分隔多根。
+#
+# ★头注更迭（2026-10-10，设计者裁定 #85 选 A）：本判据**原**为「env 未设置 =
+#   放开（默认部署零行为变更，与 2026-09-19 的读放开裁定精神一致）」——该自陈
+#   **已被 2026-10-10 裁定取代**（原文见上）。同时被取代的还有
+#   `docs/plans/统一配置层_设计_v0.1.md:356` 的「**绝不动 `security.py` 判据**」
+#   ——那一行是**登记批次**的自我约束（只登记 + 文档化语义 + 给建议），不是判据
+#   真源；设计者裁定优先于该自我约束。判据真源 = 本注 + `_whitelist_roots`。
+
+# 生效条件：无入参；`datapath.mdcg_root_configured()` 为真时返回 `datapath.mdcg_root()`；为假但 `datapath.mdcg_root()` 的目录已存在（已装记忆的默认库）时同样返回它；两者皆不成立（空白态）返回 None；datapath 解析抛异常（如 Windows 保留设备名误配的 ValueError）时原样向上抛，不吞。
+def _configured_library_root():
+    """②级：mdcg 实际配置库根；空白态返回 None。"""
+    from . import datapath
+    if datapath.mdcg_root_configured():
+        return datapath.mdcg_root()
+    p = datapath.mdcg_root()
+    return p if os.path.isdir(p) else None
+
+
+# 生效条件：无入参；恒返回 `os.path.realpath(os.getcwd())`；取不到（OSError）时返回 None。
+def _workspace_root():
+    """③级：工作区根 = 进程当前工作目录（cwd）。"""
+    try:
+        return os.path.realpath(os.getcwd())
+    except OSError:
+        return None
+
+
+#: 工作区落配置的失败告警只打一次——判据里的写副作用不得变成刷屏源（同「不静默」纪律：失败必须可见，但只需可见一次）。
+_persist_warned = [False]
+
+
+# 生效条件：ws 为非空真值时以 `datapath.set_user_root(ws, "root")` 把工作区写进**用户级** `paths.json` 的 "root" 键并返回 True；写失败（只读盘/权限等）时返回 False，且只在**首次**失败时向 stderr 打一行含 ws 与 paths_file() 的告警（不抛——写配置失败不该让判据失效，白名单本轮仍以 ws 生效）。
+def _persist_workspace_root(ws: str) -> bool:
+    """③级「并配置」：把工作区写进用户级 `paths.json` 的 "root" 键（不碰 env）。
+
+    为什么写 `paths.json` 的 "root"（= 记忆库根）而不是另开一个键：设计者原话的
+    对象就是「mdcg 的实际配置库」，仓内既有的「把记忆根配下来」的唯一机制正是
+    `datapath.set_user_root(path, "root")`（永远写用户级新位置，不写会随包更新
+    消失的旧包内件）。副作用与替代见 `docs/plans/统一配置层_设计_v0.1.md` 之外的
+    裁定留痕（本次实现报告）——**只在空白态触发**，且用户可手改该文件撤销。
+    """
+    from . import datapath
+    try:
+        datapath.set_user_root(ws, "root")
+        return True
+    except Exception as exc:                    # noqa: BLE001 —— 写配置失败不构成拒判理由
+        if not _persist_warned[0]:
+            _persist_warned[0] = True
+            sys.stderr.write(
+                "[mdcg] 记忆库根未配置且默认库根不存在，已以工作区为白名单根"
+                "（%s），但把它写进 %s 失败：%s\n"
+                % (ws, datapath.paths_file(), exc))
+        return False
+
+
+# 生效条件：env_var 环境变量去空白后非空时返回 True（该白名单根被**显式配置**）；否则 False。
+# 判据单点（issue #326-①）：`_whitelist_roots` 的「已配」分支与 mdcg_ingest 的 auto 闸共用本函数，
+# 调用方**不得各自再读一次 os.environ**——「同一语义两个落点判据」是本仓反复栽过的形态。
+def whitelist_root_configured(env_var: str) -> bool:
+    """该根白名单是否被**显式配置**（env 去空白后非空）。
+
+    根白名单有两个语义层：①「已显式配置」→ 用它（os.pathsep 多根）；②「未配置」→
+    回落记忆库根 / 工作区（#85 选 A：不再放开）。需要区分这两层的调用方（如
+    `mdcg_ingest` 的 auto 闸：未配置时 `~/.dsh/sessions` 不在回落根内，无条件过闸
+    会把**默认工作流整个拦死**，issue #326-① 实测的回归陷阱）必须经本函数判断。
+    """
+    return bool((os.environ.get(env_var) or "").strip())
+
+
+# 生效条件：env_var 环境变量去空白后非空时返回其按 os.pathsep 切分、逐段 strip+expanduser+realpath 后的非空根列表；为空时走三级回落链——②级 `_configured_library_root()` 非 None 即返回 `[realpath(该根)]`；否则取 ③级 `_workspace_root()`，非 None 时先 `_persist_workspace_root(ws)` 再返回 `[ws]`；ws 为 None（连 cwd 都取不到）时抛 PermissionError（fail-closed，绝不回落放开）。
+def _whitelist_roots(env_var: str) -> list:
+    if whitelist_root_configured(env_var):        # 判据单点（见上），不在此另写一份
+        raw = (os.environ.get(env_var) or "").strip()
+        out = []
+        for p in raw.split(os.pathsep):
+            p = p.strip()
+            if p:
+                out.append(os.path.realpath(os.path.expanduser(p)))
+        return out
+    lib = _configured_library_root()
+    if lib:
+        return [os.path.realpath(os.path.expanduser(lib))]
+    ws = _workspace_root()
+    if not ws:
+        raise PermissionError(
+            "无法确定白名单根：%s 未配置、mdcg 记忆库根未配置且默认库根不存在、"
+            "进程工作区（cwd）也取不到——fail-closed 拒访问"
+            "（P1-4；2026-10-10 设计者裁定 #85 选 A）" % env_var)
+    _persist_workspace_root(ws)
+    return [ws]
+
+
+# 生效条件：path 为 None/空串时直接返回（无路径参数，如 stat/action——不触任何回落与配置写）；否则拒绝「纯空白串」（issue #540，见 _whitespace_only_reason），再取 `_whitelist_roots(env_var)`（env 已配用它；未配回落 mdcg 记忆库根；连库根也无则取工作区并把它配置下来）后，对 realpath(expanduser(path)) 与每个根做「相等或以根+os.sep 为前缀」判定，任一命中即返回；全部未命中抛 PermissionError（含 what/原 path/realpath/roots 与「显式登记」指路）。
+#
+# issue #540：为什么不能再用 `str(path).strip() == ""` 判「没给参数」
+#   str.strip() 剥的是**全部 Unicode 空白**，而其中若干在该平台上**是合法文件名字符**。
+#   实测（Windows）——这一区分是本判据的全部依据：
+#     · `'   '`（ASCII 空格）建文件 → OSError「Permission denied」
+#     · `'\t'`（TAB）建文件        → OSError「Invalid argument」
+#       ⇒ 这两个**无法成为文件名**，当作「无路径参数」不产生可落盘的落点。
+#       既有契约 `test_p14_root_fallback.c4_no_path_arg` 正是钉住这一语义
+#       （`None`/`''`/`'   '` 不触回落、不写配置）——**本修复保留它**。
+#     · `'\u00a0'`（NBSP）建文件   → **成功**
+#     · `'\u3000'`（全角空格）建文件 → **成功**
+#       ⇒ 这两个**能真的建出文件**，而旧判据把它们当「无参数」早退放行
+#       ⇒ 实测 `op=export` + `out="\u00a0"` 把整库正文写到白名单根之外。
+#   故判据 = 「全部由空白构成，**且含 ASCII 空格以外的空白**」⇒ 拒绝。
+#   **不枚举黑名单**（Unicode 空白远多于常见几个，枚举法天然滞后）。
+_ASCII_SPACE = " "
+
+
+def _whitespace_only_reason(path) -> str:
+    """path 是否为「纯空白**且含非 ASCII 空格**」的可疑串；是则返回理由，否则返回 ""。
+
+    为何放行纯 ASCII 空格：见上方注释——该形态无法成为文件名（OS 拒绝），
+    且 `test_p14_root_fallback` 的 c4 契约把它定义为「无路径参数」。
+    本函数只拦「能被平台当成实际文件名」的那一类空白。
+    """
+    if not isinstance(path, str) or path == "" or path.strip() != "":
+        return ""
+    if path.strip(_ASCII_SPACE) == "":            # 仅由 ASCII 空格构成 ⇒ 沿用 c4 契约
+        return ""
+    return (f"路径全部由空白字符构成，拒绝（疑似绕过根约束）：{path!r}"
+            f"——纯空白不是「没给路径参数」；若要表达未提供，请传 None 或空串")
+
+
 def check_path_root(path, env_var: str, what: str) -> None:
-    raw = (os.environ.get(env_var) or "").strip()
-    if not raw:
-        return                                   # 未配置 = 放开（部署开关）
-    if path is None or str(path).strip() == "":
+    if path is None or str(path).strip(_ASCII_SPACE) == "":
         return                                   # 无路径参数（如 stat/action）
-    roots = []
-    for p in raw.split(os.pathsep):
-        p = p.strip()
-        if p:
-            roots.append(os.path.realpath(os.path.expanduser(p)))
+    _why = _whitespace_only_reason(path)
+    if _why:
+        raise PermissionError(f"{what} {_why}")
+    roots = _whitelist_roots(env_var)
     real = os.path.realpath(os.path.expanduser(str(path)))
     for r in roots:
         if real == r or real.startswith(r.rstrip(os.sep) + os.sep):
@@ -366,7 +547,78 @@ def check_path_root(path, env_var: str, what: str) -> None:
     raise PermissionError(
         f"{what} 路径超出 {env_var} 白名单，拒绝访问：{path} "
         f"(realpath={real}, roots={roots})——路径类工具参数的根约束"
-        "（P1-4），部署用该环境变量声明可读写的根目录")
+        f"（P1-4；2026-10-10 设计者裁定 #85 选 A：未配置时回落 mdcg 记忆库根，"
+        f"连库根也无则取工作区并把它配置下来）。库外读写请**显式登记**："
+        f"设 {env_var}=<根>（os.pathsep 可多根）")
+
+
+# 生效条件：path 为 None/空串时直接返回（未指定落点，不触任何判定）；否则按 realpath 判三条——① 落在辅助存储根（datapath.aux_root()，master.key/_signer.key/令牌库缺省位置）内即拒；② 落在记忆库根 lib_root 内时只许**根顶层**且文件名不以 _ / . 开头（与 op=export 缺省落点 <root>/export_*.jsonl 同位；节点只在层目录里，_keys.json/_index.json 以下划线开头）；③ 目标（含悬空符号链接）已存在且 allow_overwrite 为假即拒。全部命中放行。
+def check_export_target(path, lib_root, what: str,
+                        allow_overwrite: bool = False) -> None:
+    """导出落点的**第二道**约束（issue #211）：与白名单无关。
+
+    为什么另立判据：check_path_root 只判「在根内」，而 MDCG_EXPORT_ROOT
+    未配置时 _whitelist_roots **回落记忆库根本身**（#85 选 A）——于是
+    _keys.json、_index.json、各层节点 .md 全在可写面里。缺省部署下，
+    持 sustain 令牌（can_admin=False）的调用方两次 MCP 调用即可把证据包
+    整份替换掉数据密钥信封库：此后属主读自己的 private 记忆一律 not_found、
+    新 private 写入报 LockedError，且库内无备份（永久数据丢失）。
+
+    本函数**只加拒绝分支、不新增放行**，且不改 evidence.write_pack
+    （CLI --out 是本机用户自选落点，行为不变）。
+
+    平台口径：比较用 normcase(realpath(...))——Windows 的盘符大小写与
+    长路径前缀形态在 realpath 下不保证归一，只按原串比较即可能被绕过。
+    """
+    if path is None or str(path).strip(_ASCII_SPACE) == "":
+        return                                   # 未指定落点（含纯 ASCII 空格，同 c4 契约）
+    # issue #540：同 check_path_root —— 含非 ASCII 空白的纯空白串不是「未指定落点」。
+    # 本函数是 #211 新增的第二道落点约束，当时照抄了 `str(path).strip() == ""`，
+    # 故同样可被 NBSP/U+3000 等绕过（实测本函数对这批输入亦全部早退放行）。
+    _why = _whitespace_only_reason(path)
+    if _why:
+        raise PermissionError(f"{what} {_why}")
+    raw = os.path.expanduser(str(path))
+
+    def _norm(p):
+        return os.path.normcase(os.path.realpath(p))
+
+    real = _norm(raw)
+
+    def _inside(root):
+        r = _norm(root)
+        return real == r or real.startswith(r.rstrip(os.sep) + os.sep)
+
+    from . import datapath
+    try:
+        _aux = datapath.aux_root()
+    except ValueError as exc:
+        # aux 根解析失败（典型：末段是 Windows 保留设备名，datapath 的 #57
+        # 守卫直判拒绝）⇒ 无法校验落点是否落在密钥/令牌库内 ⇒ fail-closed
+        # 拒绝，并把原因说清楚（不把 datapath 的原始 ValueError 直接漏给
+        # 导出调用方——那会让人以为导出本身坏了）。
+        raise PermissionError(
+            f"{what}：辅助存储根无法解析，导出落点不可校验（fail-closed 拒）："
+            f"{exc}")
+    if _inside(_aux):
+        raise PermissionError(
+            f"{what}：out 不得落在辅助存储根内（密钥与令牌库所在）：{path}")
+
+    if lib_root and _inside(lib_root):
+        lib = _norm(lib_root)
+        base = os.path.basename(real)
+        if os.path.dirname(real) != lib:
+            raise PermissionError(
+                f"{what}：out 落在记忆库根内时只许根顶层的普通文件"
+                f"（不得进层目录）：{path}")
+        if base.startswith(("_", ".")):
+            raise PermissionError(
+                f"{what}：out 落在记忆库根内时文件名不得以 _ 或 . 开头"
+                f"（密钥库/索引/元数据所在）：{path}")
+
+    if (os.path.lexists(raw) or os.path.exists(real)) and not allow_overwrite:
+        raise PermissionError(
+            f"{what} 目标已存在：{path}（不覆盖已有文件）")
 
 
 # 错误处置链路角色集（批次 28 分型）：restricted（错误处置标记）的可见性

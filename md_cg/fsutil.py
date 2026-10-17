@@ -17,6 +17,7 @@ import uuid
 import errno
 import json
 import tempfile
+import threading
 
 IS_WIN = sys.platform == "win32"
 if IS_WIN:
@@ -170,6 +171,113 @@ class FileLock:
             self.acquired = False
 
 
+# 生效条件：作为 `with` 的空上下文——进入返回自身、退出返回 False（不吞异常）。
+class _NullContext:
+    """空上下文（无 root 的纯内存实例：无需跨进程互斥）。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+#: 本进程内**已持有**的跨进程锁（key -> 重入深度）。为什么需要：写面有两个天然的
+#: 嵌套关系——`writepipe.execute`（整条链：判存在/保护闸/落盘/可见性）与它内部的
+#: `MdCGOS.add`（同一 node_id）、以及 `remember_gated` 与它内部的 `add`。OS 级文件锁
+#: 在同一进程内对同一文件**第二次**获取会自我阻塞（Windows msvcrt 锁同一字节范围、
+#: POSIX flock 换 fd 亦互斥）⇒ 必须按「同线程重入」记账，否则修复本身变成死锁。
+#: 只按线程记账（threading.local）：跨线程仍各自排队，跨进程永远走 OS 锁。
+_LOCK_TLS = threading.local()
+
+# 生效条件：返回本线程的 key->深度字典（首次访问时创建），不触盘、不加锁。
+def _held_locks():
+    d = getattr(_LOCK_TLS, "held", None)
+    if d is None:
+        d = {}
+        _LOCK_TLS.held = d
+    return d
+
+# 生效条件：作为 `with` 使用——同线程已持有同 key 时只加深度并返回自身（不重复获取 OS 锁）；
+# 否则按 path 建 FileLock(timeout, strict=True) 并进入，成功后记深度 1；FileLock 抛错时
+# 不记账（失败不留下「已持有」的假象），异常原样上抛。退出时深度递减，归零才真正释放。
+class _ReentrantFileLock:
+    """`FileLock` 的同线程重入包装（跨进程互斥语义完全由内层 FileLock 提供）。"""
+
+    def __init__(self, path: str, timeout: float):
+        self.path = path
+        self.key = os.path.normcase(os.path.abspath(path))
+        self.timeout = timeout
+        self._inner = None
+
+    def __enter__(self):
+        held = _held_locks()
+        if held.get(self.key):
+            held[self.key] += 1
+            return self
+        inner = FileLock(self.path, timeout=self.timeout, strict=True)
+        inner.__enter__()
+        self._inner = inner
+        held[self.key] = 1
+        return self
+
+    def __exit__(self, *exc):
+        held = _held_locks()
+        depth = held.get(self.key, 0)
+        if depth > 1:
+            held[self.key] = depth - 1
+            return False
+        held.pop(self.key, None)
+        if self._inner is not None:
+            inner, self._inner = self._inner, None
+            return inner.__exit__(*exc)
+        return False
+
+# 生效条件：cg 具备非空 root 时返回以 `<root>/_node_locks/<node_id>` 为锁文件（FileLock 自动补 `.lock`）的跨进程排它锁（timeout 秒内未获锁抛 TimeoutError，strict 语义：「不能丢的写」宁可显式失败也不无锁放行；同线程重入按深度计数）；root 为假值返回不做任何事的空上下文；node_id 含路径分隔符/`..`/`:` 等不安全字符时改用其 sha256 前 32 位作锁名——同一 id 在任何进程里都映射到同一把锁，但绝不把调用方可控串拼进路径。
+def node_write_lock(cg, node_id, timeout: float = 30.0):
+    """同一 `node_id` 的写入跨进程串行化（issue #322）。
+
+    **不得用进程内锁冒充**：多智能体共享同一 root 时，写者可能是不同进程；
+    threading.Lock 对它们零作用。本函数一律走 `FileLock`（OS 级字节范围锁）。
+
+    锁粒度按 **node_id**：不同 id 的写入互不阻塞（写面瓶颈 S2/S4），而同一 id
+    的「判存在 → 保护闸 → 落盘 → 索引可见（flush）」必须在同一临界区内完成——
+    否则两个写者都判「不存在」，后写整份覆盖前写，两边都回执 committed:true
+    （#322 的静默丢正文）；anchor/knowledge 同 id 并发时两份文件并存，保护闸
+    在两侧都判不到对方（#322 的绕过 anchor）。
+    """
+    root = getattr(cg, "root", None)
+    if not root:
+        return _NullContext()
+    # 非字符串/空 id 一律由 add 的既有白名单 fail-closed 拒绝（它们根本走不到
+    # 落盘），此处不为它们造锁文件——空锁名还会把目录本身当文件打开。
+    if not isinstance(node_id, str) or not node_id:
+        return _NullContext()
+    name = node_id
+    if ("/" in name or "\\" in name or ".." in name or ":" in name):
+        import hashlib
+        name = "sha256_" + hashlib.sha256(
+            name.encode("utf-8", "replace")).hexdigest()[:32]
+    return _ReentrantFileLock(os.path.join(root, "_node_locks", name),
+                              timeout)
+
+
+def merge_rmw_lock(cg, timeout: float = 30.0):
+    """MERGE/CONVERGE 目标「读 → 聚合 → 整份覆写」的跨进程锁（issue #348-B）。
+
+    按**根**一把：`forgetting.reinforce` 与 `writelimit.converge_into` 的目标
+    由近重复判定选出、可能不同，但读改写窗口只有一处语义（目标正文 + merge_count），
+    根级锁让所有聚合落点共用同一临界区，避免「按目标加锁」在选目标阶段就漏掉
+    竞态。锁文件 `_merge_rmw.lock` 在 `sleep.FORBIDDEN_SUFFIXES` 内，不进版本库。
+
+    `strict=True`：锁竞争超时显式失败（调用方/重试层可见），绝不退化为无锁并发
+    ——后者正是本缺陷的形态（后写者用旧正文整份覆盖前者刚追加的聚合行）。
+    """
+    root = getattr(cg, "root", None)
+    if not root:
+        return _NullContext()
+    return _ReentrantFileLock(os.path.join(root, "_merge_rmw"), timeout)
+
+
 # 生效条件：os.path.getsize(path) 为 0 时返回 False；否则二进制打开 path 并从 size-1 处读 1 字节，返回 f.read(1) != b"\n"；getsize/open/seek/read 抛 OSError 时返回 False。
 def ends_mid_line(path: str) -> bool:
     """行式日志的最后一字节是否不是换行——即上一个写者被杀死留下的半截记录。
@@ -185,9 +293,39 @@ def ends_mid_line(path: str) -> bool:
         return False
 
 
-# 生效条件：record 序列化为 json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"；若 ends_mid_line(path) 为真则在行首再补一个 "\n"；随后建父目录并以 O_CREAT|O_WRONLY|O_APPEND、权限 0o600 打开 path 写入该行 UTF-8 字节后关闭。
-def append_jsonl(path: str, record: dict):
-    """向 append-only 日志追加一条记录（best-effort 语义）。
+# 生效条件：record 序列化为 json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"；若 ends_mid_line(path) 为真则在行首再补一个 "\n"；随后建父目录并以 O_CREAT|O_WRONLY|O_APPEND、权限 0o600 打开 path 写入该行 UTF-8 字节后关闭；成功返回 True；os.makedirs/os.open/os.write 抛 OSError（磁盘满/只读介质/权限拒绝/路径过长）时**兜住并返回 False**（best-effort 契约：簿记写入失败不得升级为业务路径失败，issue #326-④）；KeyboardInterrupt/SystemExit 是 BaseException、不在兜住面内，照常上抛。
+#: 写失败累计计数 + **有界**样本（issue #326-④ B 面）。
+#: 为什么在源头记账：`append_jsonl` 的失败契约是**返回值**（不上抛）——若无本地捕获的
+#: 调用点只是忽略返回值，失败就**静默**了（本仓 121 个调用点属此类）。把失败信号收成
+#: 本模块的**单点可观测项**后，「静默」在结构上不再可能（运维/守卫读 APPEND_FAILURES
+#: 与 _APPEND_FAIL_SAMPLES 即可；口径同 crypto._note_audit_write_failure 的 N126）。
+APPEND_FAILURES = 0            # 累计**写失败次数**（非按路径去重）
+_APPEND_FAIL_SAMPLES = []      # 有界样本：(path, 异常类型名, 截断文本)
+_APPEND_FAIL_SAMPLE_CAP = 8
+_APPEND_FAIL_WARN_CAP = 8      # stderr 告警同样有界（防刷屏）
+
+
+# 生效条件：path/exc 给定时把 APPEND_FAILURES 累加 1、在样本未满 _APPEND_FAIL_SAMPLE_CAP 时
+# 追加一条 (path, 类型名, 文本[:120])、并在累计不超 _APPEND_FAIL_WARN_CAP 时向 stderr 写一行
+# 告警；**无条件返回 False**（供 append_jsonl 直接 `return`）。不抛任何异常。
+def _note_append_failure(path, exc):
+    """登记一次 append_jsonl 写失败 + 有界告警（容忍 ≠ 静默）。"""
+    global APPEND_FAILURES
+    APPEND_FAILURES += 1
+    if len(_APPEND_FAIL_SAMPLES) < _APPEND_FAIL_SAMPLE_CAP:
+        _APPEND_FAIL_SAMPLES.append((str(path), type(exc).__name__, str(exc)[:120]))
+    if APPEND_FAILURES <= _APPEND_FAIL_WARN_CAP:
+        sys.stderr.write(
+            "[fsutil] append_jsonl 写失败（best-effort 已容忍，返回 False）%s：%s: %s"
+            "——进程内累计 %d 次；已登记 fsutil.APPEND_FAILURES / "
+            "_APPEND_FAIL_SAMPLES 供审计读取。排查方向：磁盘满 / 只读介质 / "
+            "权限拒绝 / 路径过长。\n"
+            % (path, type(exc).__name__, str(exc)[:120], APPEND_FAILURES))
+    return False
+
+
+def append_jsonl(path: str, record: dict, strict: bool = False) -> bool:
+    """向 append-only 日志追加一条记录（best-effort 语义）：成功 True、写失败 False。
 
     注意 O_APPEND 的原子性是**平台相关**的：POSIX 保证「定位到末尾 + 写入」是
     一个原子操作，Windows CRT 的 _O_APPEND 则是 lseek(END) + write 两步，并发下
@@ -195,17 +333,47 @@ def append_jsonl(path: str, record: dict):
 
     因此本函数只用于**丢一条无所谓**的簿记（访问计数）。任何不能丢的东西
     （比如索引增量）必须用 ShardedLog——每个写者独占一个分片，不共享写入点。
+
+    失败契约（issue #326-④）：本文档自陈「丢一条无所谓」，原实现却只有
+    try/finally——os.makedirs/os.open/os.write 的 OSError（磁盘满、只读介质、
+    权限拒绝、路径过长）会**击穿**调用方，把**簿记写入失败升级为业务路径失败**。
+    现按本文档兜住 OSError 并返回 False；**只**兜 OSError——KeyboardInterrupt /
+    SystemExit 是 BaseException，Type/ValueError（如 record 不可 JSON 序列化）
+    是编程错误，一概照常上抛，不把「写失败」与「用错」混为一谈。
+
+    strict（issue #426-C，2026-10-17 U06 槽内回触 U05 面）：默认 False ⇒ **既有 129 处
+    调用点行为逐位不变**（含不可写路径下「返回 False 且不抛」的旧语义）。
+    `strict=True` 供**不能丢**的队列写入（inbox / decisions）使用：失败时**先记账**
+    （_note_append_failure，保证「不静默」）**再上抛 OSError**，让调用方无法把
+    「没落盘」当成功回执发出去。**不新增第四种失败编码**：上抛的异常由工具面按仓内
+    既有三种编码（业务失败 isError=false+JSON / 异常 isError=true+JSON / read 缺失
+    null）中的「异常」形态呈现，不自创形态。
     """
     line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
     if ends_mid_line(path):
         line = "\n" + line
     d = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(d, exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    except OSError as e:
+        _note = _note_append_failure(path, e)
+        if strict:
+            raise                      # strict：失败必须让调用方看见（先记账，再上抛）
+        return _note
     try:
         os.write(fd, line.encode("utf-8"))
+        return True
+    except OSError as e:
+        _note = _note_append_failure(path, e)
+        if strict:
+            raise                      # strict：同上（记账在 _note_append_failure 内完成）
+        return _note
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 # 生效条件：os.path.exists(path) 为假时生成器直接结束不产出；否则逐行 strip，空行跳过，json.loads 成功则 yield 该对象，抛 ValueError 的行跳过，其余异常不捕获。
@@ -224,24 +392,19 @@ def read_jsonl(path: str):
                 continue
 
 
-# 生效条件：os.path.exists(path) 为假时返回 ([], None)；否则以二进制只读打开并 seek 到 offset 后一次性读到 EOF，按 b"\n" 切行逐段 decode("utf-8","replace") 再 strip，空行跳过，json.loads 成功的收入列表，ValueError 跳过；返回 (对象列表, offset+读到的字节数)——EOF 偏移是真实消费位置（stat 与 read 之间并发 append 的字节已计入），供增量缓存作水位。
+# 生效条件：文件不存在返回 ([], None)；从 offset 读到 EOF，但只解析最后一个换行之前的完整记录；完整坏行跳过，未完成尾行留待后续重读。返回记录与已消费的完整行字节水位，不以读前或读后的 stat size 代替。
 def read_jsonl_tail(path: str, offset: int):
-    """从字节偏移 offset 起**增量**读 append-only jsonl → `(records, end_offset)`。
+    """Incremental JSONL records and the last committed newline offset.
 
-    存在理由（issue #32）：propose 等高频对账每次全量重读 inbox/decisions
-    是 O(M+D)/条、批量 O(M²)；append-only 契约（写点全部经 append_jsonl，
-    无轮转/截断）下「上次扫描到的 size」必为行边界，从该偏移起只解析新增
-    字节即可。上一次写入中断在行中间（ends_mid_line 补 \\n 场景）时，残行
-    前半已在上一轮装载中被跳过、增量窗口读到的是补写的换行与新行——与
-    全量 read_jsonl 的容错结果一致。
+    A writer may still be completing JSON/UTF-8 when this reader reaches EOF.
+    Advancing beyond that suffix permanently loses the eventual record in the
+    four inbox/decisions caches. Keep the cursor at its starting line boundary.
+    Complete corrupt lines still advance the cursor; append_jsonl's crash
+    resynchronization newline therefore cannot block later valid records.
 
-    返回值（水位口径，竞态修复）：end_offset 是**实际读到的 EOF 位置**。
-    调用方若把「读前 stat 的 size」当水位，stat→read 窗口内的跨进程
-    append 会在本轮被并入、而水位偏小——下一轮增量从旧水位重读，同一条
-    记录在列表型缓存里重复并入且永不自愈。存本函数返回的 end_offset
-    即可精确续读。**读后再 stat 不可取**：re-stat 可能大于已消费位置，
-    下轮会跳过未读记录（丢账比重复更糟）。文件不存在返回 (list, None)，
-    调用方自行回落。
+    A complete append that races with the initial stat is consumed exactly
+    once: the returned cursor is measured from bytes actually read. A JSON
+    object without its terminating newline is pending, even if parseable.
     """
     if not os.path.exists(path):
         return [], None
@@ -249,7 +412,11 @@ def read_jsonl_tail(path: str, offset: int):
     with open(path, "rb") as f:
         f.seek(offset)
         data = f.read()
-    for b in data.split(b"\n"):
+    # Only complete lines are committed. A concurrent writer may still be in
+    # the middle of JSON or a UTF-8 code point: retain that suffix for the next
+    # read, rather than permanently advancing the consumer beyond it.
+    committed = data.rfind(b"\n") + 1
+    for b in data[:committed].split(b"\n"):
         line = b.decode("utf-8", "replace").strip()
         if not line:
             continue
@@ -257,7 +424,7 @@ def read_jsonl_tail(path: str, offset: int):
             recs.append(json.loads(line))
         except ValueError:
             continue
-    return recs, offset + len(data)
+    return recs, offset + committed
 
 
 _COUNT_CACHE = {}          # abspath -> (bytes_scanned, mtime_ns, lines)

@@ -47,6 +47,11 @@ _FORBIDDEN_RES = [
 ]
 _FORBIDDEN_KEYS = {"prompt", "content", "spec", "api_key", "base", "model",
                    "system_prompt", "user_prompt", "content_head"}
+#: git add/commit 子进程的超时（秒）——issue #63 同批加固：本机 git 为秒级
+#: 操作，120s 为安全上界；超时即 kill。**stdin=subprocess.DEVNULL 同加**：
+#: 不指定 stdin 时子进程继承父进程 stdin（常驻宿主下是 JSON-RPC 活管道），
+#: 读 stdin 的子进程会悬挂（先例形态 `md_cg/run_tests.py:105`）。
+_GIT_TIMEOUT_S = 120
 
 
 class InteropSanityError(ValueError):
@@ -275,6 +280,19 @@ def dispatch_verify_job(verifier_jobs_dir: str, iter_id: str,
     A2 的比对输入）。
     """
     jobs = os.path.abspath(verifier_jobs_dir)
+# N126-ANCHOR-BEGIN
+    # 产出侧（issue #126 B-2a）：派发即冻结本轮判据面——A3 的比对基准。
+    # verify_runner.py 固定读 hive/interop/<iter_id>/frozen.json（本仓标准位）；
+    # 修前 freeze() 调用点只在测试里，生产 0 处 ⇒ 门禁侧无凭证可比。
+    # 冻结失败不吞：如实记进 out["frozen_error"]（门禁侧 fail-closed：无凭证
+    # = 未互验 ⇒ 不放行），绝不假装冻结成功。
+    frozen_cred = None
+    frozen_err = None
+    try:
+        frozen_cred = freeze(iter_id)
+    except Exception as exc:                      # noqa: BLE001
+        frozen_err = "%s: %s" % (type(exc).__name__, exc)
+# N126-ANCHOR-END
     runner = os.path.join(HERE, "hive", "verify_runner.py")
     spec = {
         "model": "cmd",
@@ -294,6 +312,13 @@ def dispatch_verify_job(verifier_jobs_dir: str, iter_id: str,
            "note": "非阻塞投递完成——进度靠验证实例心跳拉取，不轮询不等待"}
     # hive/ 是源码树子系统（出货包不含）：投递本身成功，但没有可执行 runner 时
     # 消费端会静默失败 → 显式报警，不假装这一票能跑（2026-09-24 补齐）。
+# N126-ANCHOR-BEGIN
+    if frozen_err:
+        out["frozen_error"] = frozen_err
+    else:
+        out["frozen_path"] = frozen_cred.get("_path")
+        out["frozen_digest"] = frozen_cred.get("digest")
+# N126-ANCHOR-END
     if not os.path.isfile(runner):
         out["warning"] = (f"验证 runner 不存在：{runner}——投递已落盘，但本次"
                           "验证不会被消费（hive/ 为源码树子系统，安装态需另行提供）")
@@ -323,15 +348,26 @@ def write_verdict_to_repo(verdict: dict, repo: str = HERE,
     out = {"ok": True, "path": fp}
     if do_commit:
         import subprocess
-        r1 = subprocess.run(["git", "add", os.path.relpath(fp, repo)],
-                            cwd=repo, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace")
-        r2 = subprocess.run(
-            ["git", "commit", "-q", "-m",
-             f"interop(verifier): iter={it} verdict={verdict.get('verdict')} "
-             f"passed={verdict.get('passed')} failed={verdict.get('failed')}"],
-            cwd=repo, capture_output=True, text=True,
-            encoding="utf-8", errors="replace")
+        try:
+            r1 = subprocess.run(["git", "add", os.path.relpath(fp, repo)],
+                                cwd=repo, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace",
+                                timeout=_GIT_TIMEOUT_S,
+                                stdin=subprocess.DEVNULL)
+            r2 = subprocess.run(
+                ["git", "commit", "-q", "-m",
+                 f"interop(verifier): iter={it} verdict={verdict.get('verdict')} "
+                 f"passed={verdict.get('passed')} failed={verdict.get('failed')}"],
+                cwd=repo, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                timeout=_GIT_TIMEOUT_S, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            # 超时**不吞**：如实记进既有错误面（与 rc≠0 同一条 commit_err），
+            # 不假装提交成功（issue #63）。
+            out["committed"] = False
+            out["commit_err"] = ("git 超时（%ss）已被 kill：%s" %
+                                 (_GIT_TIMEOUT_S, out_dir))
+            return out
         out["committed"] = r2.returncode == 0
         if r2.returncode != 0:
             out["commit_err"] = (r2.stderr or r1.stderr)[:200]

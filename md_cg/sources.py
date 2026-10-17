@@ -48,6 +48,15 @@ class Source:
 
     name = "source"
 
+    #: #466：**来源声明面**（本件新增）。外部内容经 ingest 落库时，基底/密级取自来源声明，
+    #: 不再由写入点硬编码——「同一份外部文本走不同链得到不同基底」的根因就是硬编码。
+    #: 基底缺省 `untrusted`：在 `nodefile.VERIFICATION_BASIS`（**可接受集**）内，
+    #: 但**不在** `forgetting.VERIFIED_BASES`（**已验**集）里，也不在理科/文科两档内——
+    #: 外部内容本就不应作为可信基底进入权威记忆。
+    #: 密级缺省 `internal`（**本件不降级**：降 public 会放宽外带面，与本件方向相反）。
+    default_basis = "untrusted"
+    default_sensitivity = "internal"
+
 # 生效条件：任何调用都直接 raise NotImplementedError（基类占位，无其它分支）。
     def events(self):
         raise NotImplementedError
@@ -67,6 +76,9 @@ class JsonlSource(Source):
       role_key   —— 角色字段（默认 "role"）
       text_key   —— 文本字段（默认 "text"）
     """
+
+    default_basis = "untrusted"        # #466：外部 JSONL 会话 ⇒ 未验基底
+    default_sensitivity = "internal"
 
 # 生效条件：传入 path；name 为假值（None/空串）时回落为 "jsonl:"+os.path.basename(path)，t_key/role_key/text_key/default_role 原样存为属性（默认值 "time"/"role"/"text"/"user"）。
     def __init__(self, path: str, name: str = None, t_key="time", role_key="role",
@@ -139,6 +151,9 @@ class DSHSessionSource(Source):
       tool/call         → role=command（"name(args)" 形式）
       tool/result       → role=tool-output
     """
+
+    default_basis = "untrusted"        # #466：外部会话转录 ⇒ 未验基底
+    default_sensitivity = "internal"
 
 # 生效条件：传入 path 即成立，include_reasoning 原样存为属性（默认 False），name 固定为 "dsh:"+os.path.basename(os.path.dirname(path))。
     def __init__(self, path: str, include_reasoning: bool = False):
@@ -258,7 +273,7 @@ class DSHSessionSource(Source):
 
 
 # --------------------------------------------------------------------------
-# 蜂巢任务事件源（M6：hive/jobs → contextual，D:\2_ai 蜂巢记忆架构设计.md §5）
+# 蜂巢任务事件源（M6：hive/jobs → contextual，外部设计稿 蜂巢记忆架构设计.md §5）
 # --------------------------------------------------------------------------
 
 class HiveJobsSource(Source):
@@ -288,6 +303,11 @@ class HiveJobsSource(Source):
     """
 
     name = "hive_jobs"
+
+    #: #466：hive 任务面同为**外部**内容 ⇒ 基底缺省 untrusted；
+    #: 密级保持 internal **不变**（本件不带宽外带面），只是改为可声明。
+    default_basis = "untrusted"
+    default_sensitivity = "internal"
 
     def __init__(self, root: str, error_sensitivity: str = "private"):
         self.root = os.path.abspath(root)
@@ -519,20 +539,32 @@ class Ingestor:
                     f"{ev.get('session')}:{ev.get('seq')}")[:10])
                 if nid in self.cg.index["nodes"]:
                     continue          # 幂等
+                # #466（Lead 裁定）：基底取自**来源声明**（事件级 basis 优先，否则源级
+                # default_basis）。取值主体是形参 `source`（= Source 实例）、**不是 `self`**：
+                # 本方法是 `Ingestor.ingest(self, source, …)`，Ingestor 只是**搬运者**、不该
+                # 自己声明基底。写 `self.default_basis` 会让 Ingestor 无此属性 ⇒ AttributeError，
+                # 且被下方 except Exception 吞成 denied 计数 ⇒ **外部内容静默不落库**
+                # （2026-10-15 回归事故根因）。
+                # ★两条通道**必须同源**：CCG 正文行的「验证方式：」与 fm 的
+                # verification_basis 共用**同一个 basis 变量**——正文声明可验、枚举说未验
+                # 会让同一节点自相矛盾（守卫 H01 钉这一点）。
+                basis = ev.get("basis") or source.default_basis
                 body = ("# 功能名：会话事件\n"
                         f"# 生效条件：检索「{str(ev.get('text'))[:20]}」\n"
                         "# 子功能：记录会话事件\n"
                         f"# 执行：{str(ev.get('text'))[:80]}\n"
-                        "# 验证方式：data（会话原始记录）\n"
+                        f"# 验证方式：{basis}（会话原始记录）\n"
                         "# 不适用条件：其它会话\n\n"
                         f"{ev.get('text')}\n")
+
                 try:
                     self.cg.add(nid, body, layer=self.layer, role=ev.get("role"),
                                 tags=["session", key],
                                 # 事件级密级覆盖（M6 §5.5）：error 事件建议 private
                                 # （失败细节可能含路径/配置），缺省回落源级默认
                                 sensitivity=ev.get("sensitivity") or self.sensitivity,
-                                verification_basis="data",
+                                # #466：不再硬编码 "data"（外部内容不得自带权威基底）。
+                                verification_basis=basis,
                                 condition_space={"observation_position": key,
                                                  "observation_tool": "会话流",
                                                  "time_window": [ev.get("t") or 0,
@@ -694,12 +726,17 @@ class FileDispatcher:
                     "ids": [mod.node_id(i) for i in items[:20]],
                     "note": "预演：只抽取计数，未写盘"}
         ref_kind = "code_ref" if kind == "code" else "doc_ref"
+        _cf = []                     # #352-E：同 id 已被另一个源根占用 ⇒ 不覆写
         ids, sens = refindex.add_items(
             self.cg, items, kind=ref_kind,
             root=os.path.dirname(path) or ".", layer=layer,
-            sensitivity=sensitivity)
-        return {"ok": True, "kind": kind, "path": path, "items": len(items),
+            sensitivity=sensitivity, conflicts=_cf)
+        _out = {"ok": True, "kind": kind, "path": path, "items": len(items),
                 "indexed": len(ids), "ids": ids[:20], "sensitivity": sens}
+        if _cf:                      # 冲突不静默（单文件链同样点名）
+            _out["conflict_count"] = len(_cf)
+            _out["conflicts"] = _cf[:20]
+        return _out
 
     # ---- 目录 ----
 
@@ -730,9 +767,14 @@ class FileDispatcher:
                 root, kind=ref_kind, patterns=patterns, max_files=max_files,
                 max_items=max_items, incremental=incremental, ledger=ledger,
                 commit=False)
+            _cf = []                 # #352-E：同 id 已被另一个源根占用 ⇒ 不覆写
             ids, sens = refindex.add_items(self.cg, items, kind=ref_kind,
                                            root=root, layer=layer,
-                                           sensitivity=sensitivity)
+                                           sensitivity=sensitivity,
+                                           conflicts=_cf)
+            for _c in _cf:           # 冲突源文件的水位一并丢掉（否则下次增量跳过）
+                ledger.drop(_c.get("src")
+                            or os.path.join(root, _c.get("path") or ""))
             # 写序（同 op=index_code/index_doc）：节点先落盘，水位随后——
             # 中途被杀只会留下「节点新 + 水位旧」，下次增量重切，不会静默漏漂移。
             ledger.save()
@@ -743,6 +785,9 @@ class FileDispatcher:
                 "skipped_unchanged": stats.get("skipped_unchanged", 0),
                 "skipped_suffixes": stats.get("skipped_suffixes", []),
                 "sensitivity": sens}
+            if _cf:                  # #352-E：冲突不静默
+                out["chains"][key]["conflict_count"] = len(_cf)
+                out["chains"][key]["conflicts"] = _cf[:20]
         # 会话流（.jsonl）逐个增量摄取
         jsons = sorted(glob.glob(os.path.join(root, "**", "*.jsonl"),
                                  recursive=True))[:max_files]
@@ -796,7 +841,18 @@ def run(cg, action: str = "stat", **kw):
                              sensitivity=kw.get("sensitivity"),
                              dry_run=bool(kw.get("dry_run")))
     if act == "dir":
-        p = kw.get("path") or cg.root
+        # issue #351（2026-10-16 DSH 端）：空 path **不得**回落记忆库根。库根下是
+        # 各层节点文件、trash/、_protected_history/，把它们当外部文档切成 doc_ref
+        # 节点会 (a) 把 restricted 正文抄进 internal 节点（无令牌访客可检索）、
+        # (b) 把已 forget 并 accept 删除的节点复活。缺省根改由调用方显式给 path
+        # 或设 env MDCG_INGEST_ROOT（分派层已在白名单检查之前解析）——这里
+        # fail-closed，不猜扫描根。
+        p = kw.get("path")
+        if not p:
+            return {"ok": False, "error": (
+                "dir 动作需要 path（或设 env MDCG_INGEST_ROOT）——不猜测扫描根"
+                "（issue #351：缺省回落记忆库根会把 restricted/已删除节点"
+                "重新索引成 internal 并可被访客检索）")}
         return d.ingest_dir(p, layer=kw.get("layer"),
                             sensitivity=kw.get("sensitivity"),
                             patterns=kw.get("patterns"),
